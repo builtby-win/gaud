@@ -1,0 +1,40 @@
+{
+  "name": "@builtby-win/gaud",
+  "version": "0.1.0",
+  "description": "Pi extension for running Gaud tmux milestone orchestration natively inside Pi",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/builtby-win/gaud.git"
+  },
+  "homepage": "https://github.com/builtby-win/gaud#readme",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "gaud",
+    "tmux",
+    "coding-agent"
+  ],
+  "type": "module",
+  "packageManager": "pnpm@10.27.0",
+  "pi": {
+    "extensions": [
+      "./extensions/gaud/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke-test.ts",
+    "test": "vitest"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}
