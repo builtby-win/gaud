@@ -11,7 +11,7 @@ pi install git:github.com/builtby-win/gaud
 Or pin to a specific release:
 
 ```bash
-pi install git:github.com/builtby-win/gaud@v0.1.0
+pi install git:github.com/builtby-win/gaud@v0.1.1
 ```
 
 That's it. No global config required. After install, open Pi in any repo and run `/gaud <task>`.
@@ -40,7 +40,7 @@ Check what's available with `/gaud-doctor` after install.
 /gaud-setup                 — configure default agents and prompt sources
 ```
 
-`/gaud` defaults to the planning wizard: reads `PLAN.md` if present, otherwise walks you through creating one interactively. After reviewing the generated execution plan you approve the worker assignment before any agents launch.
+`/gaud` explicitly starts auto-planning: it reads `PLAN.md` as context when present, otherwise turns your one-line request into a PRD, milestone, tickets, and worker assignments. For normal chat requests, Gaud no longer pops up its own heuristic prompt; the foreground agent decides whether the work is small enough to do serially or complex enough to ask you about breaking it into a Gaud milestone plan.
 
 `--fake` launches bash smoke-test workers instead of real agent CLIs (useful for testing the extension itself).
 
@@ -49,10 +49,11 @@ Dashboard keys: `j`/`k` move between workers, `Enter`/`v` shows the tmux command
 ## How it works
 
 1. You describe a task; Gaud creates an execution plan with role-based worker assignments.
-2. You review and approve the plan, then workers launch in a private tmux session.
-3. The extension polls tmux pane state, pane logs, and a structured `events.jsonl` callback file.
-4. Worker callbacks (`done`, `waiting-user`, `failed`) are injected back into Pi as user messages — no manual tmux watching needed.
-5. A compact status widget stays pinned above the editor; the full dashboard is on-demand.
+2. You review and approve the plan, then persona workers launch in a private tmux session: TPM, Investigator, UX/UI, Implementer, and Integrator.
+3. Workers start with `B2V_DISABLED=true` plus provider-specific YOLO/permission-skip flags where supported.
+4. The extension polls tmux pane state, pane logs, permission prompts, stuck/dead agents, and a structured `events.jsonl` callback file.
+5. Worker callbacks (`done`, `waiting-user`, `waiting-permission`, `failed`) are injected back into Pi as `GAUDMODE ...` messages — no manual tmux watching needed.
+6. The dashboard opens automatically when implementation starts. It shows the plan path, milestone checklist, current-milestone agents/tasks, permission prompts, stuck/dead workers, relaunch/cancel actions, and latest pane output.
 
 Run dirs are written to `.gaud/runs/<run-id>/` in the current repo.
 

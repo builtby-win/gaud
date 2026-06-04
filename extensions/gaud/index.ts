@@ -3,7 +3,7 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -51,7 +51,7 @@ const STUCK_AFTER_MS = 2 * 60 * 1000;
 type RunStatus = "starting" | "running" | "waiting-user" | "done" | "failed" | "stopped" | "detached";
 type WorkerStatus = "starting" | "working" | "done" | "waiting-user" | "waiting-permission" | "stuck" | "dead" | "failed" | "unknown";
 
-type GaudRole = "gaud-design" | "gaud-eng" | "gaud-implementer" | "gaud-code-review";
+type GaudRole = "TPM" | "Investigator" | "UX/UI" | "Implementer" | "Integrator";
 
 type PromptRole = "planning" | "design" | "eng" | "implementer" | "codeReview";
 
@@ -92,10 +92,20 @@ type WorkerState = {
 	command: string;
 	promptPath: string;
 	logPath: string;
+	objective?: string;
 	lastEventAt?: number;
 	lastOutputAt?: number;
 	lastPeek?: string;
 	summary?: string;
+	restartCount?: number;
+	permissionNotifiedAt?: number;
+	stuckNotifiedAt?: number;
+};
+
+type PlanMilestone = {
+	id: string;
+	name: string;
+	status: "planned" | "in-progress" | "done";
 };
 
 export type GaudRunState = {
@@ -113,6 +123,9 @@ export type GaudRunState = {
 	piOrchestratorId?: string;
 	workers: Record<string, WorkerState>;
 	lastEventOffset: number;
+	planPath?: string;
+	milestones?: PlanMilestone[];
+	currentMilestone?: string;
 	reason?: string;
 };
 
@@ -292,9 +305,9 @@ export function agentCommand(agent: string, commandName: string, promptPath: str
 	const wrap = (invocation: string) => `bash -lc ${shellQuote(`${invocation}; ${autoCallback}`)}`;
 
 	if (agent === "claude") return wrap(`${cmd} --dangerously-skip-permissions --print ${promptSubstitution}`);
-	if (agent === "codex") return wrap(`${cmd} exec --dangerously-bypass-approvals-and-sandbox ${promptSubstitution}`);
-	if (agent === "gemini") return wrap(`${cmd} --yolo --prompt ${promptSubstitution}`);
-	if (agent === "opencode") return wrap(`${cmd} run --dangerously-skip-permissions ${promptSubstitution}`);
+	if (agent === "codex") return wrap(`${cmd} --yolo ${promptSubstitution}`);
+	if (agent === "gemini") return wrap(`${cmd} --yolo -i ${promptSubstitution}`);
+	if (agent === "opencode") return wrap(`${cmd} --prompt ${promptSubstitution}`);
 	if (agent === "antigravity" || agent === "agy") return wrap(`${cmd} --dangerously-skip-permissions --print ${promptSubstitution}`);
 	return wrap(`${cmd} ${promptSubstitution}`);
 }
@@ -331,7 +344,7 @@ export function workerEnvPrefix(worker: Pick<WorkerState, "id" | "agent" | "role
 	return [
 		`B2V_DISABLED=true`,
 		`GAUD_WORKER_ID=${shellQuote(worker.id)}`,
-		`GAUD_WORKER_ROLE=${shellQuote(worker.role || "implementer")}`,
+		`GAUD_WORKER_ROLE=${shellQuote(worker.role || "Implementer")}`,
 		`GAUD_WORKSTREAM=${shellQuote(worker.workstream || worker.id)}`,
 		`GAUD_AGENT=${shellQuote(worker.agent)}`,
 		`GAUD_MILESTONE=M1`,
@@ -440,7 +453,7 @@ function workerPrompt(task: string, agent: string, workerId: string, plan?: Work
 	const assignment = plan
 		? `Assigned role: ${plan.role}\nAssigned objective:\n${plan.objective}\n\nPrimary files/areas:\n${plan.files.map((file) => `- ${file}`).join("\n")}\n\nDone criteria:\n${plan.doneCriteria.map((item) => `- ${item}`).join("\n")}`
 		: `Focus on the slice implied by your worker id/agent. Keep changes small and coherent.`;
-	return `You are a Gaud background specialist worker.\n\nTask:\n${task}\n\nWorker id: ${workerId}\nAgent: ${agent}\nRole: ${role}\n\n${assignment}\n\nCoordination rules:\n- Avoid broad unrelated refactors.\n- Prefer small, reviewable changes in your assigned files.\n- If you need to edit outside your assigned files, explain why in your callback summary.\n- Run the relevant checks before reporting done when practical.\n\nStatus protocol:\n- When done, run: $GAUD_CALLBACK_BIN done --summary "${role}: brief summary"\n- If blocked on the user, run: $GAUD_CALLBACK_BIN waiting-user --question "specific question"\n- If blocked on permission, run: $GAUD_CALLBACK_BIN waiting-permission --summary "specific permission needed"\n- If failed, run: $GAUD_CALLBACK_BIN failed --summary "brief failure"\n`;
+	return `You are a Gaud background specialist worker.\n\nTask:\n${task}\n\nWorker id: ${workerId}\nAgent: ${agent}\nRole: ${role}\n\n${assignment}\n\nCoordination rules:\n- Avoid broad unrelated refactors.\n- Prefer small, reviewable changes in your assigned files.\n- If you need to edit outside your assigned files, explain why in your callback summary.\n- Run the relevant checks before reporting done when practical.\n- Default reasonable product/engineering details yourself; ask the user only when ambiguity would materially change the outcome.\n- If your CLI/tooling prompts for approval, credentials, network access, or destructive permission and you cannot safely proceed, immediately report waiting-permission with the exact prompt/permission needed.\n- Keep status summaries operator-friendly: changed files, current blocker, next action, and verification.\n\nStatus protocol:\n- When done, run: $GAUD_CALLBACK_BIN done --summary "${role}: brief summary"\n- If blocked on the user, run: $GAUD_CALLBACK_BIN waiting-user --question "specific question"\n- If blocked on permission, run: $GAUD_CALLBACK_BIN waiting-permission --summary "specific permission needed"\n- If failed, run: $GAUD_CALLBACK_BIN failed --summary "brief failure"\n`;
 }
 
 async function createCallbackHelper(runDir: string) {
@@ -451,7 +464,7 @@ async function createCallbackHelper(runDir: string) {
 import fs from 'node:fs';
 const args = process.argv.slice(2);
 const type = args.shift() || 'event';
-const data = { ts: Date.now(), type, runId: process.env.GAUD_RUN_ID, workerId: process.env.GAUD_WORKER_ID, agent: process.env.GAUD_AGENT };
+const data = { ts: Date.now(), type, runId: process.env.GAUD_RUN_ID, workerId: process.env.GAUD_WORKER_ID, agent: process.env.GAUD_AGENT, role: process.env.GAUD_WORKER_ROLE, milestone: process.env.GAUD_MILESTONE, workstream: process.env.GAUD_WORKSTREAM };
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
   if (arg.startsWith('--')) data[arg.slice(2)] = args[++i] || '';
@@ -472,6 +485,30 @@ console.log('[gaud-callback]', type, data.summary || data.question || '');
 
 async function tmux(run: GaudRunState, args: string[]): Promise<ExecResult> {
 	return execFile("tmux", ["-L", run.tmuxSocket, ...args], { cwd: run.repoRoot, timeoutMs: 10_000 });
+}
+
+function extractPlanPath(task: string): string | undefined {
+	const match = /Execution plan:\s*(.+)$/mi.exec(task);
+	return match?.[1]?.trim();
+}
+
+function extractMilestones(planText: string): PlanMilestone[] {
+	const matches = [...planText.matchAll(/^##\s+Milestone\s+(\d+)\s*:?\s*(.+)$/gmi)];
+	const milestones = matches.map((match, index) => ({
+		id: `M${match[1] ?? index + 1}`,
+		name: (match[2] ?? `Milestone ${index + 1}`).trim(),
+		status: index === 0 ? "in-progress" as const : "planned" as const,
+	}));
+	return milestones.length ? milestones : [{ id: "M1", name: "Current milestone", status: "in-progress" }];
+}
+
+async function loadPlanOverview(task: string): Promise<{ planPath?: string; milestones: PlanMilestone[]; currentMilestone: string }> {
+	const planPath = extractPlanPath(task);
+	if (planPath && existsSync(planPath)) {
+		const milestones = extractMilestones(await readFile(planPath, "utf8"));
+		return { planPath, milestones, currentMilestone: milestones[0]?.id ?? "M1" };
+	}
+	return { planPath, milestones: [{ id: "M1", name: "Current milestone", status: "in-progress" }], currentMilestone: "M1" };
 }
 
 async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, agents: string[], fake: boolean, reason?: string, workerPlans?: WorkerPlan[]) {
@@ -505,6 +542,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	await mkdir(path.join(runDir, "prompts"), { recursive: true });
 	await writeFile(eventsPath, "", "utf8");
 	const callbackBin = await createCallbackHelper(runDir);
+	const planOverview = await loadPlanOverview(task);
 
 	const run: GaudRunState = {
 		id,
@@ -521,6 +559,9 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 		piOrchestratorId: ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getLeafId() ?? undefined,
 		workers: {},
 		lastEventOffset: 0,
+		planPath: planOverview.planPath,
+		milestones: planOverview.milestones,
+		currentMilestone: planOverview.currentMilestone,
 		reason,
 	};
 	activeRun = run;
@@ -552,7 +593,8 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 		await writeFile(promptPath, workerPrompt(task, agent, workerId, plan), "utf8");
 		await writeFile(logPath, "", "utf8");
 		const command = agentCommand(agent, commandName, promptPath, fake);
-		const envPrefix = workerEnvPrefix({ id: workerId, agent, role: "implementer", workstream: workerId });
+		const workerRole = plan?.role ?? "Implementer";
+		const envPrefix = workerEnvPrefix({ id: workerId, agent, role: workerRole, workstream: workerId });
 		const paneResult = await tmux(run, ["split-window", "-d", "-t", tmuxSession, "-P", "-F", "#{pane_id}", `${envPrefix} exec ${command}`]);
 		const paneId = paneResult.stdout.trim();
 		await tmux(run, ["select-layout", "-t", tmuxSession, "tiled"]);
@@ -560,13 +602,14 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 		run.workers[workerId] = {
 			id: workerId,
 			agent,
-			role: "implementer",
+			role: workerRole,
 			workstream: workerId,
 			status: "starting",
 			paneId,
 			command,
 			promptPath,
 			logPath,
+			objective: plan?.objective,
 			lastEventAt: Date.now(),
 		};
 	}
@@ -577,7 +620,8 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	await persistRun(pi);
 	refreshUi(ctx);
 	startPolling(pi, ctx);
-	ctx.ui.notify(`Started Gaud run ${id} with agents: ${resolvedAgents.map((agent) => agent.agent).join(", ")}. Pinned status is visible above the editor; use /gaud-dashboard or Ctrl+Shift+G for the detailed dashboard.`, "info");
+	ctx.ui.notify(`Started Gaud run ${id} with agents: ${resolvedAgents.map((agent) => agent.agent).join(", ")}. Opening dashboard.`, "info");
+	if (ctx.hasUI) showGaudDashboard(pi, ctx);
 }
 
 async function persistRun(pi?: ExtensionAPI) {
@@ -611,6 +655,36 @@ async function pollTmux(run: GaudRunState) {
 	}
 }
 
+function permissionPromptSummary(peek: string): string | undefined {
+	const tail = peek.split("\n").slice(-12).join("\n");
+	if (/\b(allow|approve|permission|required approval|proceed|continue|confirm)\b/i.test(tail)
+		&& /\b(y\/n|yes\/no|\[y|\(y|press enter|enter to continue|approval|permission|sandbox|network|write|delete|destructive)\b/i.test(tail)) {
+		return tail.replace(/\s+/g, " ").trim().slice(-500);
+	}
+	return undefined;
+}
+
+function stuckDiagnosis(worker: WorkerState): { summary: string; autoRelaunch: boolean } {
+	const peek = worker.lastPeek ?? "";
+	const tail = peek.split("\n").slice(-20).join("\n").trim();
+	const compactTail = tail.replace(/\s+/g, " ").slice(-700);
+	const permission = permissionPromptSummary(peek);
+	if (permission) return { summary: `suspected-stuck: permission prompt waiting: ${permission}`, autoRelaunch: false };
+	if (/\b(rate limit|quota|credits exhausted|usage limit|too many requests|429)\b/i.test(tail)) {
+		return { summary: `suspected-stuck: provider quota/rate limit detected: ${compactTail}`, autoRelaunch: false };
+	}
+	if (/\b(auth|login|oauth|api key|not authenticated|credentials?)\b/i.test(tail)) {
+		return { summary: `suspected-stuck: authentication/credential prompt detected: ${compactTail}`, autoRelaunch: false };
+	}
+	if (/\b(error|exception|traceback|failed|command not found|no such file|permission denied)\b/i.test(tail)) {
+		return { summary: `suspected-stuck: error output detected: ${compactTail}`, autoRelaunch: false };
+	}
+	if (/(^|\n)\s*(?:[\w.@-]+[:][^\n]*[$#%❯]|[$#%❯])\s*$/m.test(tail)) {
+		return { summary: `suspected-stuck: agent appears to have dropped to a shell prompt: ${compactTail}`, autoRelaunch: true };
+	}
+	return { summary: `suspected-stuck: no pane activity for ${STUCK_AFTER_MS / 60000}m; latest output: ${compactTail || "(no output captured)"}`, autoRelaunch: false };
+}
+
 async function pollPanePeeks(run: GaudRunState) {
 	for (const worker of Object.values(run.workers)) {
 		if (!worker.paneId) continue;
@@ -622,6 +696,11 @@ async function pollPanePeeks(run: GaudRunState) {
 				if (worker.status === "stuck") worker.status = "working";
 			}
 			worker.lastPeek = peek;
+			const permission = permissionPromptSummary(peek);
+			if (permission && !["done", "failed"].includes(worker.status)) {
+				worker.status = "waiting-permission";
+				worker.summary = `permission prompt: ${permission}`;
+			}
 		}
 	}
 }
@@ -656,12 +735,16 @@ async function pollEvents(pi: ExtensionAPI, ctx: ExtensionContext, run: GaudRunS
 		}
 		if (type === "done" && Object.values(run.workers).every((w) => w.status === "done")) {
 			run.status = "done";
+			if (run.milestones?.[0]) run.milestones[0].status = "done";
 			stopPolling();
-			dashboardHandle?.hide?.();
 		}
 		try {
 			if (["done", "waiting-user", "waiting-permission", "failed"].includes(type)) {
-				const text = `GAUDMODE ${type} ${workerId}: ${String(event.summary ?? event.question ?? "")}`;
+				const role = String(event.role ?? worker?.role ?? "Implementer");
+				const milestone = String(event.milestone ?? "M1");
+				const workstream = String(event.workstream ?? workerId);
+				const summary = String(event.summary ?? event.question ?? "").replace(/\s+/g, " ").trim();
+				const text = `GAUDMODE ${type} role=${role} milestone=${milestone} workstream=${workstream} summary=${summary}`;
 				pi.sendUserMessage(text, { deliverAs: "followUp" });
 			} else {
 				pi.sendMessage({ customType: "gaud-event", content: `Gaud event ${type} from ${workerId}`, display: true, details: event });
@@ -690,9 +773,27 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 		const preStuck = new Set(Object.values(activeRun.workers).filter((w) => w.status === "stuck").map((w) => w.id));
 		markStuckWorkers(activeRun);
 		for (const worker of Object.values(activeRun.workers)) {
-			if (worker.status === "stuck" && !preStuck.has(worker.id)) {
+			if (worker.status === "dead" && (worker.restartCount ?? 0) < 1) {
+				try { ctx.ui.notify(`Worker ${worker.id} pane died; relaunching once with the same prompt.`, "error"); } catch { /* stale ctx */ }
+				await restartWorker(pi, ctx, worker.id, false);
+				continue;
+			}
+			if (worker.status === "stuck" && (!preStuck.has(worker.id) || Date.now() - (worker.stuckNotifiedAt ?? 0) > 60_000)) {
+				worker.stuckNotifiedAt = Date.now();
 				const cmd = tmuxWorkerViewCommand(activeRun, worker);
-				try { ctx.ui.notify(`Worker ${worker.id} is stuck (no activity for ${STUCK_AFTER_MS / 60000}m).\n\nJump to pane:\n${cmd}`, "error"); } catch { /* stale ctx */ }
+				const diagnosis = stuckDiagnosis(worker);
+				worker.summary = diagnosis.summary;
+				try {
+					pi.sendUserMessage(`GAUDMODE waiting-user role=${worker.role || "Implementer"} milestone=M1 workstream=${worker.workstream || worker.id} summary=${diagnosis.summary}`, { deliverAs: "followUp" });
+				} catch { /* stale ctx */ }
+				try { ctx.ui.notify(`Worker ${worker.id} is stuck.\n${diagnosis.summary}\n\n${diagnosis.autoRelaunch ? "Auto-relaunching once because this looks like a shell-drop." : `Use dashboard key s or /gaud-restart ${worker.id} to relaunch after reviewing.`}\n\nJump to pane:\n${cmd}`, "error"); } catch { /* stale ctx */ }
+				if (diagnosis.autoRelaunch && (worker.restartCount ?? 0) < 1) {
+					await restartWorker(pi, ctx, worker.id, false);
+				}
+			}
+			if (worker.status === "waiting-permission" && worker.summary && Date.now() - (worker.permissionNotifiedAt ?? 0) > 60_000) {
+				worker.permissionNotifiedAt = Date.now();
+				try { ctx.ui.notify(`Worker ${worker.id} needs permission:\n${worker.summary}\n\nInspect with /gaud-peek ${worker.id}; approve in tmux or restart/cancel from dashboard.`, "error"); } catch { /* stale ctx */ }
 			}
 		}
 		await persistRun(pi);
@@ -755,6 +856,97 @@ async function stopRun(pi: ExtensionAPI, ctx: ExtensionContext, killTmux: boolea
 	ctx.ui.notify(statusText(), "info");
 }
 
+function findWorker(workerId: string): WorkerState | undefined {
+	return activeRun?.workers[workerId];
+}
+
+async function confirmWorkerAction(ctx: ExtensionContext, title: string, message: string): Promise<boolean> {
+	if (!ctx.hasUI) return true;
+	return ctx.ui.confirm(title, message);
+}
+
+async function cancelWorker(pi: ExtensionAPI, ctx: ExtensionContext, workerId: string, confirm = true): Promise<boolean> {
+	if (!activeRun) {
+		ctx.ui.notify("No active Gaud run.", "info");
+		return false;
+	}
+	const worker = findWorker(workerId);
+	if (!worker) {
+		ctx.ui.notify(`No worker found: ${workerId}`, "error");
+		return false;
+	}
+	if (!worker.paneId) {
+		ctx.ui.notify(`Worker ${workerId} has no tmux pane to cancel.`, "error");
+		return false;
+	}
+	if (confirm) {
+		const ok = await confirmWorkerAction(ctx, "Cancel Gaud worker?", `Send Ctrl+C to ${worker.id} (${worker.agent})?\n\nPane: ${worker.paneId}`);
+		if (!ok) return false;
+	}
+	const result = await tmux(activeRun, ["send-keys", "-t", worker.paneId, "C-c"]);
+	if (result.code !== 0) {
+		ctx.ui.notify(`Failed to cancel ${worker.id}: ${result.stderr.trim() || "tmux send-keys failed"}`, "error");
+		return false;
+	}
+	worker.status = "working";
+	worker.summary = "Ctrl+C sent by user";
+	worker.lastEventAt = Date.now();
+	await persistRun(pi);
+	refreshUi(ctx);
+	ctx.ui.notify(`Sent Ctrl+C to ${worker.id}. Use /gaud-peek ${worker.id} to inspect output.`, "info");
+	return true;
+}
+
+async function restartWorker(pi: ExtensionAPI, ctx: ExtensionContext, workerId: string, confirm = true): Promise<boolean> {
+	if (!activeRun) {
+		ctx.ui.notify("No active Gaud run.", "info");
+		return false;
+	}
+	const worker = findWorker(workerId);
+	if (!worker) {
+		ctx.ui.notify(`No worker found: ${workerId}`, "error");
+		return false;
+	}
+	if (confirm) {
+		const ok = await confirmWorkerAction(ctx, "Restart Gaud worker?", `Kill and recreate ${worker.id} (${worker.agent}) with the same prompt and command?\n\nOld pane: ${worker.paneId ?? "none"}`);
+		if (!ok) return false;
+	}
+
+	const oldPaneId = worker.paneId;
+	const markerPath = path.join(activeRun.runDir, "workers", worker.id, "callback.done");
+	await rm(markerPath, { force: true });
+	const paneResult = await tmux(activeRun, ["split-window", "-d", "-t", activeRun.tmuxSession, "-P", "-F", "#{pane_id}", `${workerEnvPrefix(worker)} exec ${worker.command}`]);
+	if (paneResult.code !== 0) {
+		ctx.ui.notify(`Failed to restart ${worker.id}: ${paneResult.stderr.trim() || "tmux split-window failed"}`, "error");
+		return false;
+	}
+	const newPaneId = paneResult.stdout.trim();
+	if (!newPaneId) {
+		ctx.ui.notify(`Failed to restart ${worker.id}: tmux did not return a new pane id.`, "error");
+		return false;
+	}
+	const pipeResult = await tmux(activeRun, ["pipe-pane", "-o", "-t", newPaneId, `cat >> ${shellQuote(worker.logPath)}`]);
+	if (pipeResult.code !== 0) {
+		ctx.ui.notify(`Restarted ${worker.id}, but failed to re-bind pane logging: ${pipeResult.stderr.trim() || "tmux pipe-pane failed"}`, "error");
+	}
+	await tmux(activeRun, ["select-layout", "-t", activeRun.tmuxSession, "tiled"]);
+	if (oldPaneId && oldPaneId !== newPaneId) await tmux(activeRun, ["kill-pane", "-t", oldPaneId]);
+	worker.paneId = newPaneId;
+	worker.paneIndex = undefined;
+	worker.pid = undefined;
+	worker.status = "starting";
+	worker.summary = confirm ? "Restarted by user" : "Relaunched automatically after pane failure";
+	worker.restartCount = (worker.restartCount ?? 0) + 1;
+	worker.lastEventAt = Date.now();
+	worker.lastOutputAt = undefined;
+	worker.lastPeek = undefined;
+	activeRun.status = "running";
+	await persistRun(pi);
+	refreshUi(ctx);
+	ctx.ui.notify(`Restarted ${worker.id} in pane ${newPaneId}.`, "info");
+	return true;
+}
+
 function slugify(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "workstream";
 }
@@ -762,39 +954,47 @@ function slugify(value: string): string {
 export function buildWorkerPlans(planText: string, focus: string, roleAgents: GaudConfig["roles"]): WorkerPlan[] {
 	const templates: Array<Omit<WorkerPlan, "agent">> = [
 		{
-			id: "gaud-design",
-			role: "gaud-design",
-			objective: "Review the requested milestone before implementation. Improve product/UX shape, identify user-facing risks, and refine acceptance criteria. Do not make broad code changes unless the plan explicitly calls for docs/copy edits.",
+			id: "tpm",
+			role: "TPM",
+			objective: "Turn the approved outcome into one current milestone with small tickets, dependencies, verification, and check-back triggers. Do not implement.",
+			files: ["PLAN.md", ".gaud/plans/*", "README.md"],
+			doneCriteria: ["Program and milestone DONE criteria are explicit or a concrete blocker is reported.", "Tickets are small, non-overlapping, and scoped to the current milestone.", "Verification commands and check-back triggers are named."],
+		},
+		{
+			id: "investigator",
+			role: "Investigator",
+			objective: "Gather repo facts, edge cases, risks, and implementation constraints for the current milestone. Do not implement unless explicitly assigned cleanup.",
+			files: ["PLAN.md", "README.md", "extensions/gaud/index.ts", "test/*", "scripts/*"],
+			doneCriteria: ["Relevant files and conventions are identified.", "Risks or blockers are concrete and milestone-scoped.", "One recommended default is provided for non-blocking ambiguity."],
+		},
+		{
+			id: "ux-ui",
+			role: "UX/UI",
+			objective: "Review the current milestone for product shape, user journey, copy, layout, and acceptance criteria. Mark non-user-facing work as not applicable quickly.",
 			files: ["PLAN.md", "README.md", "extensions/gaud/index.ts"],
-			doneCriteria: ["Design/UX risks are called out or marked not applicable.", "Acceptance criteria are concrete enough for implementers.", "Any proposed scope change is explicit."],
+			doneCriteria: ["UX/product risks are called out or marked not applicable.", "Acceptance criteria are concrete enough for implementers.", "Any proposed scope change is explicit."],
 		},
 		{
-			id: "gaud-eng",
-			role: "gaud-eng",
-			objective: "Lock the engineering plan for the milestone. Identify architecture boundaries, state/data flow, tmux/polling failure modes, and test strategy before implementation proceeds.",
-			files: ["PLAN.md", "extensions/gaud/index.ts", "test/*", "scripts/*"],
-			doneCriteria: ["Architecture risks and edge cases are documented or addressed.", "Implementation tickets are small and non-overlapping.", "Verification commands are named."],
+			id: "implementer",
+			role: "Implementer",
+			objective: "Implement one scoped current-milestone ticket only after reading the execution plan. Keep changes small and verify locally.",
+			files: ["extensions/gaud/index.ts", "README.md", "PLAN.md", "test/*"],
+			doneCriteria: ["Scoped code/docs changes are complete.", "Relevant checks pass if code changed.", "Callback summary lists changed files and verification."],
 		},
 		{
-			id: "gaud-implementer",
-			role: "gaud-implementer",
-			objective: "Implement the assigned milestone slice only after reading the execution plan. Keep changes scoped and verify locally.",
-			files: ["extensions/gaud/index.ts", "README.md", "PLAN.md"],
-			doneCriteria: ["Scoped code/docs changes are complete.", "pnpm check passes if code changed.", "Callback summary lists changed files and verification."],
-		},
-		{
-			id: "gaud-code-review",
-			role: "gaud-code-review",
-			objective: "Review the resulting milestone changes for correctness, safety, callback protocol issues, and missed tests. Prefer reporting findings over rewriting unrelated code.",
+			id: "integrator",
+			role: "Integrator",
+			objective: "Integrate current milestone outputs, review correctness/safety/tests, resolve small glue issues, and report whether the milestone is ready for dogfooding or PM review.",
 			files: ["extensions/gaud/index.ts", "README.md", "PLAN.md", "scripts/*", "test/*"],
-			doneCriteria: ["Review findings are concrete and severity-ranked.", "Critical issues are fixed or reported as blockers.", "No unrelated refactors."],
+			doneCriteria: ["Review findings are concrete and severity-ranked.", "Critical issues are fixed or reported as blockers.", "Milestone readiness and verification evidence are summarized."],
 		},
 	];
 	const assignments: Array<{ role: GaudRole; agent: string }> = [];
-	if (roleAgents["gaud-design"]) assignments.push({ role: "gaud-design", agent: roleAgents["gaud-design"] });
-	if (roleAgents["gaud-eng"]) assignments.push({ role: "gaud-eng", agent: roleAgents["gaud-eng"] });
-	for (const agent of roleAgents["gaud-implementer"] ?? []) assignments.push({ role: "gaud-implementer", agent });
-	if (roleAgents["gaud-code-review"]) assignments.push({ role: "gaud-code-review", agent: roleAgents["gaud-code-review"] });
+	if (roleAgents["gaud-eng"]) assignments.push({ role: "TPM", agent: roleAgents["gaud-eng"] });
+	if (roleAgents["gaud-eng"]) assignments.push({ role: "Investigator", agent: roleAgents["gaud-eng"] });
+	if (roleAgents["gaud-design"]) assignments.push({ role: "UX/UI", agent: roleAgents["gaud-design"] });
+	for (const agent of roleAgents["gaud-implementer"] ?? []) assignments.push({ role: "Implementer", agent });
+	if (roleAgents["gaud-code-review"]) assignments.push({ role: "Integrator", agent: roleAgents["gaud-code-review"] });
 
 	return assignments.map(({ role, agent }, index) => {
 		const template = templates.find((item) => item.role === role) ?? templates[index % templates.length];
@@ -824,28 +1024,98 @@ async function askRequired(ctx: ExtensionContext, title: string, placeholder: st
 	}
 }
 
-async function createPlanByInterview(ctx: ExtensionContext): Promise<{ markdown: string; focus: string } | undefined> {
-	const idea = await askRequired(ctx, "What are we trying to build or change?", "Describe the product/codebase outcome in one paragraph");
+export function createAutogeneratedPlan(idea: string, cwd: string): { markdown: string; focus: string } {
+	const trimmedIdea = idea.trim();
+	const repoName = path.basename(cwd);
+	const milestoneName = "M1 — Plan, implement, verify";
+	const focus = `${milestoneName}: ${trimmedIdea}`;
+	const today = new Date().toISOString().slice(0, 10);
+	const markdown = `# Gaud Execution Plan
+
+## PRD
+
+- Problem: ${trimmedIdea}
+- Target user: inferred from the repo and request; clarify only if implementation choices depend on a specific persona.
+- Desired outcome: the requested change works end-to-end and is easy for the user to verify.
+- Non-goals: avoid unrelated refactors, remote artifacts, and scope expansion not needed for this milestone.
+- Constraints: preserve existing project conventions in ${repoName}; keep changes small and reviewable.
+- Risks: hidden product assumptions, missing tests, and ambiguous acceptance details should be surfaced as worker blockers only when they materially change the implementation.
+
+## Program DONE Criteria
+
+- [ ] Requested behavior is implemented or documented as intentionally out of scope.
+- [ ] Current milestone DONE criteria pass.
+- [ ] Relevant tests/checks are run, or skipped with a concrete reason.
+- [ ] Any remaining ambiguity is recorded with a recommended default.
+
+## Role Map
+
+- Orchestrator: Pi agent
+- gaud-design: selected at launch
+- gaud-eng: selected at launch
+- gaud-implementer: selected at launch
+- gaud-code-review: selected at launch
+
+## Milestone 1: ${milestoneName}
+
+- Status: ready
+- Goal: turn the user's request into the smallest coherent implementation slice, including local verification.
+- Depends on: none known
+- User-testable: yes
+
+### Milestone DONE Criteria
+
+- [ ] Repo conventions and relevant files are inspected before edits.
+- [ ] Implementation changes are scoped to the request.
+- [ ] Documentation/help text is updated if behavior or usage changes.
+- [ ] \`pnpm check\` or the nearest project-specific check passes if code changed.
+- [ ] Final callback summarizes changed files, verification, and any follow-up questions.
+
+### Tickets
+
+## Ticket 1: Discovery and plan tightening
+- Owner: gaud-eng
+- Deliverable: identify impacted files, edge cases, verification command, and any ambiguity that truly blocks execution.
+- Verification: concise architecture/ticket note in callback.
+- Check-back trigger: only ask the user if multiple reasonable defaults would lead to incompatible implementations.
+
+## Ticket 2: Product/design acceptance pass
+- Owner: gaud-design
+- Deliverable: refine acceptance criteria, copy/user-facing behavior, and milestone risks without broadening scope by default.
+- Verification: concise acceptance/risk note in callback.
+- Check-back trigger: only ask the user for a product decision if the default would be surprising or destructive.
+
+## Ticket 3: Implementation
+- Owner: gaud-implementer
+- Deliverable: implement the smallest useful slice for the request.
+- Verification: run the relevant checks and report results.
+- Check-back trigger: ask only for missing credentials/permissions or genuinely blocking product ambiguity.
+
+## Ticket 4: Review
+- Owner: gaud-code-review
+- Deliverable: review changes for correctness, safety, tests, and missed acceptance criteria.
+- Verification: severity-ranked findings or explicit pass.
+- Check-back trigger: only block on critical issues that cannot be safely default-fixed.
+
+## Dogfooding Gate
+
+- Scenario to exercise: run the command/flow affected by the request, or use the nearest automated check for internal-only changes.
+- Must-pass outcomes: match milestone DONE criteria.
+
+## PM Decisions
+
+- Date: ${today}
+- Decision: Initial Gaud plan was auto-generated from the user's request.
+- Why: Gaud should default obvious planning details itself and ask the user only for material clarification.
+- Next action: Review/edit the generated plan if desired, then launch workers.
+`;
+	return { markdown, focus };
+}
+
+async function createPlanByInterview(ctx: ExtensionContext, seededIdea?: string): Promise<{ markdown: string; focus: string } | undefined> {
+	const idea = seededIdea?.trim() || await askRequired(ctx, "What are we trying to build or change?", "Describe the outcome. Gaud will infer milestones/tickets and ask later only if blocked.");
 	if (!idea) return undefined;
-	const targetUser = await askRequired(ctx, "Who is this for?", "User/dev persona or system owner");
-	if (!targetUser) return undefined;
-	const desiredOutcome = await askRequired(ctx, "What should be true when this is done?", "Observable outcome, not implementation activity");
-	if (!desiredOutcome) return undefined;
-	const nonGoals = await ctx.ui.input("What should Gaud NOT do?", "Non-goals / out-of-scope changes");
-	const constraints = await ctx.ui.input("Constraints or risks?", "Files to avoid, compatibility, safety, deadlines, unknowns");
-	const programDone = await ctx.ui.editor("Program DONE criteria", "- [ ] Outcome is clear enough to judge complete/incomplete\n- [ ] User-visible or system-visible behavior is explicit\n- [ ] Required verification is named\n- [ ] Open questions are resolved or tracked as blockers");
-	if (!programDone) return undefined;
-	const milestoneName = await askRequired(ctx, "Current milestone name", "Smallest coherent milestone to implement first");
-	if (!milestoneName) return undefined;
-	const milestoneGoal = await askRequired(ctx, "Current milestone goal", "What this one milestone accomplishes");
-	if (!milestoneGoal) return undefined;
-	const milestoneDone = await ctx.ui.editor("Milestone DONE criteria", "- [ ] ...\n- [ ] pnpm check passes\n- [ ] User can verify via ...");
-	if (!milestoneDone) return undefined;
-	const tickets = await ctx.ui.editor("Current milestone tickets only", "## Ticket 1: <name>\n- Owner: gaud-implementer\n- Deliverable:\n- Verification:\n- Check-back trigger:\n\n## Ticket 2: <name>\n- Owner: gaud-implementer\n- Deliverable:\n- Verification:\n- Check-back trigger:");
-	if (!tickets) return undefined;
-	const dogfood = await ctx.ui.input("Dogfooding scenario", "How should a human verify this milestone? Use 'none' if internal-only.");
-	const markdown = `# Gaud Execution Plan\n\n## PRD\n\n- Problem: ${idea}\n- Target user: ${targetUser}\n- Desired outcome: ${desiredOutcome}\n- Non-goals: ${nonGoals || "TBD"}\n- Constraints: ${constraints || "TBD"}\n- Risks: ${constraints || "TBD"}\n\n## Program DONE Criteria\n\n${programDone}\n\n## Role Map\n\n- Orchestrator: Pi agent\n- gaud-design: selected at launch\n- gaud-eng: selected at launch\n- gaud-implementer: selected at launch\n- gaud-code-review: selected at launch\n\n## Milestone 1: ${milestoneName}\n\n- Status: ready\n- Goal: ${milestoneGoal}\n- Depends on: none known\n- User-testable: ${dogfood && dogfood.toLowerCase() !== "none" ? "yes" : "no"}\n\n### Milestone DONE Criteria\n\n${milestoneDone}\n\n### Tickets\n\n${tickets}\n\n## Dogfooding Gate\n\n- Scenario to exercise: ${dogfood || "none"}\n- Must-pass outcomes: match milestone DONE criteria\n\n## PM Decisions\n\n- Date: ${new Date().toISOString().slice(0, 10)}\n- Decision: Initial Gaud plan created interactively.\n- Why: Real workers require an approved plan before launch.\n- Next action: Review assignment and launch workers.\n`;
-	return { markdown, focus: `${milestoneName}: ${milestoneGoal}` };
+	return createAutogeneratedPlan(idea, ctx.cwd);
 }
 
 async function pickAgent(ctx: ExtensionContext, title: string, installed: string[], preferred?: string): Promise<string | undefined> {
@@ -999,6 +1269,54 @@ async function chooseRoleAgents(ctx: ExtensionContext, parsedAgents: string[]): 
 	return config;
 }
 
+function firstInstalled(installed: string[], preferred: string[]): string | undefined {
+	return preferred.find((agent) => installed.includes(agent)) ?? installed[0];
+}
+
+async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: string[]): Promise<GaudConfig | undefined> {
+	const installed = await detectInstalledAgents();
+	if (installed.length === 0) {
+		ctx.ui.notify("No supported agent CLIs found. Install claude, opencode, codex, gemini, or antigravity/agy, then run /gaud-doctor.", "error");
+		return undefined;
+	}
+	const saved = await loadGaudConfig(ctx.cwd);
+	const savedRoles = saved?.roles ?? {};
+	const parsedInstalled = parsedAgents.filter((agent) => installed.includes(agent));
+	const savedImplementers = savedRoles["gaud-implementer"]?.filter((agent) => installed.includes(agent));
+	const fallbackImplementer = firstInstalled(installed, [...DEFAULT_AGENTS]);
+	const implementers = parsedInstalled.length > 0
+		? parsedInstalled
+		: savedImplementers?.length
+			? savedImplementers
+			: fallbackImplementer
+				? [fallbackImplementer]
+				: [];
+	const design = savedRoles["gaud-design"] && installed.includes(savedRoles["gaud-design"])
+		? savedRoles["gaud-design"]
+		: firstInstalled(installed, ["claude", "opencode", "codex", "gemini", "antigravity"]);
+	const eng = savedRoles["gaud-eng"] && installed.includes(savedRoles["gaud-eng"])
+		? savedRoles["gaud-eng"]
+		: firstInstalled(installed, ["codex", "claude", "opencode", "gemini", "antigravity"]);
+	const review = savedRoles["gaud-code-review"] && installed.includes(savedRoles["gaud-code-review"])
+		? savedRoles["gaud-code-review"]
+		: firstInstalled(installed, ["codex", "claude", "opencode", "gemini", "antigravity"]);
+	if (!design || !eng || !review || implementers.length === 0) return undefined;
+	const config: GaudConfig = {
+		orchestrator: { type: "pi", agent: "pi" },
+		roles: {
+			"gaud-design": design,
+			"gaud-eng": eng,
+			"gaud-implementer": implementers,
+			"gaud-code-review": review,
+		},
+		promptSources: saved?.promptSources,
+	};
+	const needsPersistedRoles = !savedRoles["gaud-design"] || !savedRoles["gaud-eng"] || !savedRoles["gaud-implementer"]?.length || !savedRoles["gaud-code-review"];
+	if (needsPersistedRoles) await saveLocalGaudConfig(ctx.cwd, config);
+	ctx.ui.notify(`Gaud selected agents: design=${design}, eng=${eng}, implementer=${implementers.join(",")}, review=${review}. ${needsPersistedRoles ? "Saved defaults." : "Run /gaud setup to change defaults."}`, "info");
+	return config;
+}
+
 async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: string) {
 	const parsed = parseArgs(args);
 	const taskArg = parsed.task && parsed.task !== "doctor" && parsed.task !== "status" ? parsed.task : "";
@@ -1012,35 +1330,34 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 	let sourceLabel = sourcePath;
 
 	if (existsSync(absoluteSourcePath)) {
-		const useExisting = seededFocus
-			? await ctx.ui.confirm("Gaud plan source", `Use existing ${sourcePath} as the planning source for this focus?\n\n${seededFocus}`)
-			: await ctx.ui.confirm("Gaud plan source", `Use existing ${sourcePath} as the planning source? Choose No to create a new plan interactively.`);
-		if (useExisting) {
+		if (seededFocus) {
 			planText = await readFile(absoluteSourcePath, "utf8");
-			if (!focus) focus = await ctx.ui.input("Gaud plan focus", "What milestone/slice should workers implement next?");
-			if (!focus) return;
+			ctx.ui.notify(`Using existing ${sourcePath} as context and auto-generating the current milestone from your request.`, "info");
+		} else {
+			const useExisting = await ctx.ui.confirm("Gaud plan source", `Use existing ${sourcePath} as the planning source? Choose No to start from a one-line request.`);
+			if (useExisting) {
+				planText = await readFile(absoluteSourcePath, "utf8");
+				focus = await ctx.ui.input("Gaud plan focus", "What milestone/slice should workers implement next?");
+				if (!focus) return;
+			}
 		}
 	}
 
 	if (!planText) {
-		const interview = await createPlanByInterview(ctx);
-		if (!interview) return;
-		planText = interview.markdown;
-		focus = interview.focus;
-		sourceLabel = "interactive interview";
+		const generated = await createPlanByInterview(ctx, seededFocus);
+		if (!generated) return;
+		planText = generated.markdown;
+		focus = generated.focus;
+		sourceLabel = seededFocus ? "user request" : "one-line request";
 	}
 
 	if (!focus) return;
 	const approvedFocus = focus;
 	let existingConfig = await loadGaudConfig(ctx.cwd);
 	if (!existingConfig?.promptSources) {
-		const configure = await ctx.ui.confirm("Set up Gaud methodology?", "Choose planning/review prompt sources before generating the launch plan? You can use built-in defaults, local gstack/skills files, or remote gstack URLs.");
-		if (configure) {
-			await runSetupWizard(ctx);
-			existingConfig = await loadGaudConfig(ctx.cwd);
-		}
+		existingConfig = { orchestrator: { type: "pi", agent: "pi" }, roles: {}, promptSources: { planning: { type: "builtin" }, design: { type: "builtin" }, eng: { type: "builtin" }, implementer: { type: "builtin" }, codeReview: { type: "builtin" } } };
 	}
-	const roleConfig = await chooseRoleAgents(ctx, parsed.agents);
+	const roleConfig = await defaultRoleAgentsForRun(ctx, parsed.agents);
 	if (!roleConfig) return;
 	const promptSources = existingConfig?.promptSources ?? { planning: { type: "builtin" }, design: { type: "builtin" }, eng: { type: "builtin" }, implementer: { type: "builtin" }, codeReview: { type: "builtin" } };
 	const methodology = await Promise.all([
@@ -1138,6 +1455,14 @@ class GaudDashboardComponent implements Component {
 		else if (data === "G") this.selected = Math.max(0, workers.length - 1);
 		else if (matchesKey(data, "p") || matchesKey(data, "space")) this.showPane = !this.showPane;
 		else if (matchesKey(data, "r")) void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
+		else if (matchesKey(data, "x")) {
+			const worker = this.selectedWorker();
+			if (worker) void cancelWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
+		}
+		else if (matchesKey(data, "s")) {
+			const worker = this.selectedWorker();
+			if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
+		}
 		else if (matchesKey(data, "a")) this.notifyAttach();
 		else if (matchesKey(data, "return") || matchesKey(data, "v")) this.notifyAttach(this.selectedWorker());
 		else if (matchesKey(data, "y")) {
@@ -1157,32 +1482,53 @@ class GaudDashboardComponent implements Component {
 		lines.push(border(`╭${"─".repeat(innerW)}╮`));
 		lines.push(line(th.fg("accent", "Gaud Dashboard") + `  ${activeRun ? activeRun.id : "no active run"}`));
 		lines.push(line(activeRun ? `${statusText()}` : "No active Gaud run."));
-		lines.push(line("keys: j/k · Enter/v tmux cmd · p pane · r refresh · a attach · q close"));
+		lines.push(line("keys: ↑↓/j/k select · Enter/v tmux · p output · s relaunch · x cancel · r refresh · q close"));
 		lines.push(line());
 		if (activeRun) {
 			const workers = this.workers();
-			const needsAttention = workers.filter((w) => w.status === "stuck" || w.status === "waiting-user" || w.status === "waiting-permission");
-			if (needsAttention.length > 0) {
-				lines.push(line(th.fg("error", `⚠ needs attention: ${needsAttention.map((w) => `${w.id} (${w.status})`).join(", ")}`)));
-				lines.push(line());
+			const counts = workers.reduce<Record<string, number>>((acc, worker) => {
+				acc[worker.status] = (acc[worker.status] ?? 0) + 1;
+				return acc;
+			}, {});
+			lines.push(line(`run: ${activeRun.status} · ${Object.entries(counts).map(([status, count]) => `${status}:${count}`).join(" ")} · poll: ${pollHealthText()}`));
+			if (activeRun.planPath) lines.push(line(`plan: ${activeRun.planPath}`));
+			if (activeRun.milestones?.length) {
+				const milestoneText = activeRun.milestones.map((milestone) => {
+					const icon = milestone.status === "done" ? "✓" : milestone.status === "in-progress" ? "●" : "○";
+					const text = `${icon} ${milestone.id} ${milestone.name}`;
+					return milestone.status === "in-progress" ? th.fg("accent", text) : milestone.status === "done" ? th.fg("success", text) : th.fg("muted", text);
+				}).join("  ");
+				lines.push(line(`milestones: ${milestoneText}`));
 			}
+			const currentAgents = workers.filter((worker) => worker.status !== "done").map((worker) => `${worker.role}:${worker.id}`).join(", ");
+			lines.push(line(`current milestone agents: ${currentAgents || "none active"}`));
+			const needsAttention = workers.filter((w) => w.status === "stuck" || w.status === "waiting-user" || w.status === "waiting-permission" || w.status === "dead");
+			if (needsAttention.length > 0) {
+				lines.push(line(th.fg("error", `⚠ action needed: ${needsAttention.map((w) => `${w.id}/${w.role}:${w.status}`).join(", ")}`)));
+			}
+			lines.push(line());
+			lines.push(line(th.fg("muted", "   status                role          worker              agent       last activity  summary")));
 			for (let index = 0; index < workers.length; index++) {
 				const worker = workers[index]!;
 				const marker = index === this.selected ? th.fg("accent", "▸") : " ";
 				const symbol = workerStatusSymbol(worker.status);
-				const status = th.fg(workerStatusColor(worker.status), `${symbol} ${worker.status}`.padEnd(20));
-				const activity = formatAge(workerLastActivity(worker));
+				const status = th.fg(workerStatusColor(worker.status), `${symbol} ${worker.status}`.padEnd(21));
+				const activity = formatAge(workerLastActivity(worker)).padEnd(13);
 				const summary = worker.summary ? ` ${worker.summary}` : "";
-				lines.push(line(`${marker}${status} ${worker.id.padEnd(16)} ${worker.agent.padEnd(10)} ${activity}${summary}`));
+				lines.push(line(`${marker}${status} ${(worker.role || "").padEnd(13)} ${worker.id.padEnd(19)} ${worker.agent.padEnd(10)} ${activity}${summary}`));
 			}
 			const worker = this.selectedWorker();
 			if (worker) {
 				lines.push(line());
-				lines.push(line(th.fg("accent", `Selected: ${worker.id}`) + `  ${th.fg(workerStatusColor(worker.status), `${workerStatusSymbol(worker.status)} ${worker.status}`)}`));
+				lines.push(line(th.fg("accent", `Selected: ${worker.id}`) + `  role=${worker.role} agent=${worker.agent} restarts=${worker.restartCount ?? 0}`));
+				if (worker.objective) lines.push(line(`task: ${worker.objective.replace(/\s+/g, " ").slice(0, innerW - 8)}`));
+				lines.push(line(th.fg(workerStatusColor(worker.status), `${workerStatusSymbol(worker.status)} ${worker.status}`) + (worker.summary ? ` — ${worker.summary}` : "")));
+				if (worker.status === "waiting-permission") lines.push(line(th.fg("warning", "permission: approve in tmux if safe, or press s to relaunch / x to cancel")));
+				if (worker.status === "stuck" || worker.status === "dead") lines.push(line(th.fg("warning", "health: press s to relaunch this worker with the same prompt")));
 				lines.push(line(`tmux: ${tmuxWorkerViewCommand(activeRun, worker)}`));
 				if (this.showPane) {
 					lines.push(line("latest pane output:"));
-					const paneLines = (worker.lastPeek || "(no pane output captured yet)").split("\n").slice(-12);
+					const paneLines = (worker.lastPeek || "(no pane output captured yet)").split("\n").slice(-14);
 					for (const paneLine of paneLines) lines.push(line(`  ${paneLine}`));
 				}
 			}
@@ -1278,14 +1624,10 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			return { action: "handled" as const };
 		}
 
-		if (!activeRun && looksParallelizable(event.text)) {
-			const yes = await ctx.ui.confirm("Maybe use Gaud?", "This looks like a Gaud-sized build/change with separable workstreams. Create a Gaud execution plan first?");
-			if (yes) {
-				await runPlanningWizard(pi, ctx, event.text);
-				return { action: "handled" as const };
-			}
-		}
-
+		// Non-explicit requests should flow to the foreground orchestrator model.
+		// The model has gaud_start_run guidance and can decide whether to ask the
+		// user about a Gaud plan. Avoid extension-level heuristic popups here:
+		// small tasks should stay serial, and borderline tasks need model judgment.
 		return { action: "continue" as const };
 	});
 
@@ -1301,11 +1643,13 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "gaud_start_run",
 		label: "Start Gaud Run",
-		description: "Start a Gaud tmux background worker run for tasks that benefit from multiple agents.",
-		promptSnippet: "Start Gaud mode to parallelize large implementation tasks in tmux workers.",
+		description: "Create and optionally launch a Gaud milestone plan for work that benefits from multiple agents.",
+		promptSnippet: "Use Gaud only after you reason that the task is complex/parallelizable, or when the user explicitly asks for gaud/god mode.",
 		promptGuidelines: [
-			"Use gaud_start_run when the user's task has separable workstreams, multiple modules, or would benefit from parallel implementation.",
-			"Do not use gaud_start_run for small one-file edits, simple questions, or tasks where serial execution is clearly faster.",
+			"First decide yourself whether Gaud is warranted. Use normal serial editing for small/simple/single-file tasks.",
+			"For complex work with separable workstreams, multiple modules, uncertain architecture, or milestone-based delivery, ask the user whether they want to break it into a Gaud plan before calling this tool unless they explicitly requested Gaud.",
+			"When called, Gaud will auto-generate the PRD, milestone, tickets, and worker assignments from the user's request and should only ask the user for material clarifications or launch approval.",
+			"Do not call gaud_start_run just because a request contains words like build/fix/update; use judgment about scope and parallelism.",
 		],
 		parameters: Type.Object({
 			task: Type.String({ description: "The user's task to parallelize." }),
@@ -1314,8 +1658,10 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			fake: Type.Optional(Type.Boolean({ description: "Launch fake bash workers for smoke testing." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			await launchRun(pi, ctx, params.task, params.agents?.length ? params.agents : [...DEFAULT_AGENTS], Boolean(params.fake), params.reason);
-			return { content: [{ type: "text", text: statusText() }], details: { run: activeRun } };
+			const agentArg = params.agents?.length ? ` --agents ${params.agents.join(",")}` : "";
+			const fakeArg = params.fake ? " --fake" : "";
+			await runPlanningWizard(pi, ctx, `${agentArg}${fakeArg} ${params.task}`.trim());
+			return { content: [{ type: "text", text: activeRun ? statusText() : "Gaud plan flow completed without launching workers." }], details: { run: activeRun, reason: params.reason } };
 		},
 	});
 
@@ -1408,6 +1754,30 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			}
 			const workerCommands = Object.values(activeRun.workers).map((worker) => `${worker.id}: ${tmuxWorkerViewCommand(activeRun!, worker)}`);
 			ctx.ui.notify([tmuxAttachCommand(activeRun), "", "Worker panes:", ...workerCommands].join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("gaud-cancel", {
+		description: "Send Ctrl+C to a specific Gaud worker pane. Usage: /gaud-cancel <worker-id>",
+		handler: async (args, ctx) => {
+			const workerId = args.trim();
+			if (!workerId) {
+				ctx.ui.notify("Usage: /gaud-cancel <worker-id>", "error");
+				return;
+			}
+			await cancelWorker(pi, ctx, workerId);
+		},
+	});
+
+	pi.registerCommand("gaud-restart", {
+		description: "Restart a specific Gaud worker pane and re-bind logging/state. Usage: /gaud-restart <worker-id>",
+		handler: async (args, ctx) => {
+			const workerId = args.trim();
+			if (!workerId) {
+				ctx.ui.notify("Usage: /gaud-restart <worker-id>", "error");
+				return;
+			}
+			await restartWorker(pi, ctx, workerId);
 		},
 	});
 
