@@ -1843,14 +1843,14 @@ export default function gaudExtension(pi: ExtensionAPI) {
 		name: "ask_user",
 		label: "Ask User",
 		description: "Ask the user a clarifying question with suggested options and your recommendation. Use when you need user input to proceed — never guess when you can ask.",
-		promptSnippet: "When you need a decision from the user, call ask_user with analyzed options and your recommendation. The user can pick an option or type their own.",
+		promptSnippet: "When the user's intent is unclear or you need to align on approach before launching Gaud workers, call ask_user with analyzed options and your recommendation.",
 		promptGuidelines: [
-			"Use ask_user for: scoping decisions, implementation approach choices, priority tradeoffs, clarification of ambiguous requirements.",
-			"Each option should have a label (1-5 words) and a description explaining the tradeoffs.",
-			"Always include a recommendation — mark it clearly in the question text like 'Recommended: Option B'.",
-			"Keep options to 2-5. More than 5 = you haven't narrowed the choices enough.",
-			"Do NOT use ask_user for discoverable facts (explore the codebase first). Ask for preferences, tradeoffs, and decisions only.",
-			"The last option is always 'Other — type my own answer' for custom input. Don't add it yourself — the UI handles it.",
+			"Only use ask_user when genuinely unclear — not for confirmation of obvious choices. The user should align the plan with you BEFORE Gaud workers start.",
+			"Use ask_user for: ambiguous scope, competing implementation approaches, missing constraints that change the plan, priority tradeoffs the user must decide.",
+			"Do NOT use ask_user for: discoverable facts (read the codebase), yes/no confirmations on clear defaults, questions you can answer by reasoning.",
+			"Each option must have a short label and a description explaining the tradeoff. Put your recommended option first.",
+			"Keep it to 2-5 options. More than 5 means you haven't analyzed the choices enough.",
+			"The user navigates with ↑↓ or j/k, selects with Enter, or types a custom answer. Esc cancels.",
 		],
 		parameters: Type.Object({
 			question: Type.String({ description: "The question to ask the user. Be specific about what decision is needed." }),
@@ -1887,8 +1887,8 @@ export default function gaudExtension(pi: ExtensionAPI) {
 							cachedLines = undefined; tui.requestRender();
 							return;
 						}
-						if (matchesKey(data, Key.up)) { optionIndex = Math.max(0, optionIndex - 1); cachedLines = undefined; tui.requestRender(); return; }
-						if (matchesKey(data, Key.down)) { optionIndex = Math.min(allOptions.length - 1, optionIndex + 1); cachedLines = undefined; tui.requestRender(); return; }
+						if (matchesKey(data, Key.up) || data === "k") { optionIndex = Math.max(0, optionIndex - 1); cachedLines = undefined; tui.requestRender(); return; }
+						if (matchesKey(data, Key.down) || data === "j") { optionIndex = Math.min(allOptions.length - 1, optionIndex + 1); cachedLines = undefined; tui.requestRender(); return; }
 						if (matchesKey(data, Key.enter)) {
 							const selected = allOptions[optionIndex];
 							if (selected === allOptions[allOptions.length - 1]) { editMode = true; cachedLines = undefined; tui.requestRender(); }
@@ -1927,7 +1927,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 							}
 							lines.push(border(theme.fg("dim", " Enter to submit · Esc to go back")));
 						} else {
-							lines.push(border(theme.fg("dim", " ↑↓ navigate · Enter to select · Esc to cancel")));
+							lines.push(border(theme.fg("dim", " ↑↓/j k navigate · Enter to select · Esc to cancel")));
 						}
 						lines.push(border(`╰${"─".repeat(innerW)}╯`));
 						cachedLines = lines;
