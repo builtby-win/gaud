@@ -1425,8 +1425,8 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 	let sourceLabel = sourcePath;
 
 	if (missingExplicitPath) {
-		ctx.ui.notify(`Gaud plan file not found: ${taskArgPath}. Put the markdown plan in this repo, pass an absolute path, or run /gaud with no args to use discovered local plans.`, "error");
-		return;
+		focus = parsed.task;
+		sourceLabel = "user request";
 	}
 
 	if (existsSync(absoluteSourcePath)) {
@@ -1440,7 +1440,7 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 		}
 	}
 	if (!planText) {
-		const generated = await createPlanByInterview(ctx, seededFocus);
+		const generated = await createPlanByInterview(ctx, focus);
 		if (!generated) return;
 		planText = generated.markdown;
 		focus = generated.focus;
