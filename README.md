@@ -40,7 +40,7 @@ Check what's available with `/gaud-doctor` after install.
 /gaud-setup                 — configure default agents and prompt sources
 ```
 
-`/gaud` explicitly starts auto-planning: it reads `PLAN.md` as context when present, otherwise turns your one-line request into a PRD, milestone, tickets, and worker assignments. For normal chat requests, Gaud no longer pops up its own heuristic prompt; the foreground agent decides whether the work is small enough to do serially or complex enough to ask you about breaking it into a Gaud milestone plan.
+`/gaud` explicitly starts auto-planning: it first looks for an existing markdown plan (`PLAN.md`, previous `.gaud/plans/*.md`, or root-level plan/spec markdown such as `google-drive-firmware-plan.md`) and uses that as context when present. If no plan is found, it turns your one-line request into a PRD, milestone, tickets, and worker assignments. For normal chat requests, Gaud no longer pops up its own heuristic prompt; the foreground agent decides whether the work is small enough to do serially or complex enough to ask you about breaking it into a Gaud milestone plan.
 
 `--fake` launches bash smoke-test workers instead of real agent CLIs (useful for testing the extension itself).
 

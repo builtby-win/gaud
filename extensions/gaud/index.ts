@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import type { Component, OverlayOptions, TUI } from "@earendil-works/pi-tui";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -100,6 +100,7 @@ type WorkerState = {
 	restartCount?: number;
 	permissionNotifiedAt?: number;
 	stuckNotifiedAt?: number;
+	trustAutoRespondedAt?: number;
 };
 
 type PlanMilestone = {
@@ -147,6 +148,8 @@ let consecutivePollErrors = 0;
 let lastPollError: string | undefined;
 let dashboardOpen = false;
 let dashboardHandle: { focus?: () => void; setHidden?: (hidden: boolean) => void; hide?: () => void } | undefined;
+let dashboardOffset = { x: 0, y: 0 };
+let planningInFlight = false;
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -290,13 +293,117 @@ function parseArgs(args: string): { task: string; agents: string[]; fake: boolea
 	return { task: taskTokens.join(" ").trim(), agents: agents?.length ? agents : [...DEFAULT_AGENTS], fake };
 }
 
+type MarkdownPlanCandidate = {
+	path: string;
+	relativePath: string;
+	mtimeMs: number;
+	score: number;
+};
+
+export type PlanningSource = {
+	taskArg: string;
+	taskArgPath: string;
+	taskArgExists: boolean;
+	taskArgLooksLikePath: boolean;
+	seededFocus?: string;
+	sourcePath: string;
+	absoluteSourcePath: string;
+	missingExplicitPath: boolean;
+};
+
+function isMarkdownPlanName(name: string): boolean {
+	if (!/\.(md|markdown)$/i.test(name)) return false;
+	const lower = name.toLowerCase();
+	if (["readme.md", "changelog.md", "contributing.md", "license.md"].includes(lower)) return false;
+	return lower === "plan.md" || lower.includes("plan") || lower.includes("prd") || lower.includes("spec") || lower.includes("gaud") || lower.includes("firmware");
+}
+
+function planCandidateScore(relativePath: string): number {
+	const normalized = relativePath.replace(/\\/g, "/").toLowerCase();
+	if (normalized === "plan.md") return 100;
+	if (normalized.startsWith(".gaud/plans/") && normalized.endsWith(".md")) return 90;
+	if (!normalized.includes("/") && normalized.includes("plan")) return 80;
+	if (!normalized.includes("/") && (normalized.includes("prd") || normalized.includes("spec") || normalized.includes("firmware"))) return 70;
+	if (normalized.includes("/node_modules/") || normalized.startsWith("node_modules/")) return 0;
+	return 10;
+}
+
+async function listMarkdownPlanCandidates(cwd: string): Promise<MarkdownPlanCandidate[]> {
+	const candidates: MarkdownPlanCandidate[] = [];
+	const addIfPlan = async (absolutePath: string, relativePath: string, mtimeMs: number) => {
+		if (!isMarkdownPlanName(path.basename(relativePath))) return;
+		const score = planCandidateScore(relativePath);
+		if (score <= 0) return;
+		candidates.push({ path: absolutePath, relativePath, mtimeMs, score });
+	};
+
+	try {
+		for (const entry of await readdir(cwd, { withFileTypes: true })) {
+			if (entry.isFile()) {
+				const absolutePath = path.join(cwd, entry.name);
+				const fileStat = await stat(absolutePath);
+				await addIfPlan(absolutePath, entry.name, fileStat.mtimeMs);
+			}
+		}
+	} catch {
+		return candidates;
+	}
+
+	const gaudPlansDir = path.join(cwd, ".gaud", "plans");
+	try {
+		for (const entry of await readdir(gaudPlansDir, { withFileTypes: true })) {
+			if (!entry.isFile()) continue;
+			const relativePath = path.join(".gaud", "plans", entry.name);
+			const absolutePath = path.join(gaudPlansDir, entry.name);
+			const fileStat = await stat(absolutePath);
+			await addIfPlan(absolutePath, relativePath, fileStat.mtimeMs);
+		}
+	} catch {
+		return candidates.sort((left, right) => right.score - left.score || right.mtimeMs - left.mtimeMs || left.relativePath.localeCompare(right.relativePath));
+	}
+
+	return candidates.sort((left, right) => right.score - left.score || right.mtimeMs - left.mtimeMs || left.relativePath.localeCompare(right.relativePath));
+}
+
+export async function discoverDefaultPlanPath(cwd: string): Promise<string | undefined> {
+	return (await listMarkdownPlanCandidates(cwd))[0]?.relativePath;
+}
+
+export async function resolvePlanningSource(cwd: string, parsedTask: string): Promise<PlanningSource> {
+	const taskArg = parsedTask && parsedTask !== "doctor" && parsedTask !== "status" ? parsedTask : "";
+	const taskArgPath = taskArg ? (path.isAbsolute(taskArg) ? taskArg : path.join(cwd, taskArg)) : "";
+	const taskArgExists = Boolean(taskArgPath && existsSync(taskArgPath));
+	const taskArgLooksLikePath = Boolean(taskArg && (taskArgExists || /\.(md|markdown|txt)$/i.test(taskArg) || taskArg.includes("/")));
+	const discoveredSourcePath = !taskArg ? await discoverDefaultPlanPath(cwd) : undefined;
+	const seededFocus = taskArgLooksLikePath ? undefined : taskArg || undefined;
+	const sourcePath = taskArgLooksLikePath ? taskArg : discoveredSourcePath ?? "PLAN.md";
+	const absoluteSourcePath = path.isAbsolute(sourcePath) ? sourcePath : path.join(cwd, sourcePath);
+	return {
+		taskArg,
+		taskArgPath,
+		taskArgExists,
+		taskArgLooksLikePath,
+		seededFocus,
+		sourcePath,
+		absoluteSourcePath,
+		missingExplicitPath: taskArgLooksLikePath && !taskArgExists,
+	};
+}
+
+function inferPlanFocus(planText: string, sourcePath: string): string {
+	const title = /^#\s+(.+)$/m.exec(planText)?.[1]?.trim();
+	const milestone = /^##\s+Milestone\s+\d+\s*:?\s*(.+)$/mi.exec(planText)?.[1]?.trim();
+	const base = milestone || title || path.basename(sourcePath, path.extname(sourcePath)).replace(/[-_]+/g, " ");
+	return base.startsWith("M1") ? base : `M1 — ${base}`;
+}
+
 export function agentCommand(agent: string, commandName: string, promptPath: string, fake: boolean): string {
 	if (fake) {
 		return `bash -lc ${shellQuote(`echo "[gaud] fake ${agent} worker started"; sleep 2; echo "[gaud] fake ${agent} worker done"; "$GAUD_CALLBACK_BIN" done --summary "fake ${agent} completed"; exec bash`)}`;
 	}
 
 	const promptRef = shellQuote(promptPath);
-	const callbackInstruction = `When you finish or become blocked, report status by running one of these commands:\n$GAUD_CALLBACK_BIN done --summary "what changed"\n$GAUD_CALLBACK_BIN waiting-user --question "what you need"\n$GAUD_CALLBACK_BIN failed --summary "what failed"`;
+	const callbackInstruction = `When you finish or become blocked, report status by running one of these commands:\n$GAUD_CALLBACK_BIN done --summary "what changed"\n$GAUD_CALLBACK_BIN waiting-user --question "what you need"\n$GAUD_CALLBACK_BIN waiting-permission --summary "what you need permission for"\n$GAUD_CALLBACK_BIN failed --summary "what failed"`;
 	const promptCommand = `cat ${promptRef}; printf '\n\n%s\n' ${shellQuote(callbackInstruction)}`;
 	const promptSubstitution = `"$(${promptCommand})"`;
 	const cmd = shellQuote(commandName);
@@ -420,16 +527,18 @@ function renderWidget(): string[] {
 	if (stuckOrWaiting.length > 0) {
 		lines.push(`⚠ needs attention: ${stuckOrWaiting.join(", ")} — /gaud-peek ${stuckOrWaiting[0]} or Ctrl+Shift+G`);
 	}
-	lines.push(`/gaud-peek [worker] · /gaud-attach · ${tmuxAttachCommand(activeRun)}`);
+	lines.push(`Dashboard: Ctrl+Shift+G / Ctrl+D (q to close) · /gaud-peek [worker] · ${tmuxAttachCommand(activeRun)}`);
 	return lines;
 }
 
 function refreshUi(ctx?: UiContext) {
 	if (!ctx || !extensionActive) return;
 	try {
-		const status = activeRun ? `gaud: ${activeRun.status} · ${pollInFlight ? "polling" : `next ${formatEta(nextPollAt)}`}` : "gaud: idle";
+		const status = activeRun
+			? `gaud: ${activeRun.status} · ${pollInFlight ? "polling" : `next ${formatEta(nextPollAt)}`} · Ctrl+Shift+G dashboard`
+			: "gaud: idle · Ctrl+Shift+G dashboard";
 		ctx.ui.setStatus("gaud", status);
-		ctx.ui.setWidget("gaud", renderWidget());
+		ctx.ui.setWidget("gaud", dashboardOpen ? undefined : renderWidget());
 	} catch {
 		// Extension contexts become stale during shutdown/reload. Polling is best-effort.
 	}
@@ -621,6 +730,12 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	refreshUi(ctx);
 	startPolling(pi, ctx);
 	ctx.ui.notify(`Started Gaud run ${id} with agents: ${resolvedAgents.map((agent) => agent.agent).join(", ")}. Opening dashboard.`, "info");
+	try {
+		pi.sendUserMessage(
+			`Gaud run ${id} started. Workers: ${resolvedAgents.map((a) => `${a.agent}`).join(", ")}. Tmux socket: ${tmuxSocket}.\n\nIMPORTANT: The Pi extension owns all polling and GAUDMODE callback forwarding for this run. Do NOT invoke gaud-poll, gaud-tmux-layout, or any other gaud-mode skill infrastructure commands — they conflict with the extension's built-in poller. Worker callbacks will arrive automatically as GAUDMODE follow-up messages. Wait for them before taking action.`,
+			{ deliverAs: "followUp" },
+		);
+	} catch { /* stale ctx at launch */ }
 	if (ctx.hasUI) showGaudDashboard(pi, ctx);
 }
 
@@ -655,34 +770,10 @@ async function pollTmux(run: GaudRunState) {
 	}
 }
 
-function permissionPromptSummary(peek: string): string | undefined {
-	const tail = peek.split("\n").slice(-12).join("\n");
-	if (/\b(allow|approve|permission|required approval|proceed|continue|confirm)\b/i.test(tail)
-		&& /\b(y\/n|yes\/no|\[y|\(y|press enter|enter to continue|approval|permission|sandbox|network|write|delete|destructive)\b/i.test(tail)) {
-		return tail.replace(/\s+/g, " ").trim().slice(-500);
-	}
-	return undefined;
-}
-
-function stuckDiagnosis(worker: WorkerState): { summary: string; autoRelaunch: boolean } {
+function stuckSummary(worker: WorkerState): string {
 	const peek = worker.lastPeek ?? "";
 	const tail = peek.split("\n").slice(-20).join("\n").trim();
-	const compactTail = tail.replace(/\s+/g, " ").slice(-700);
-	const permission = permissionPromptSummary(peek);
-	if (permission) return { summary: `suspected-stuck: permission prompt waiting: ${permission}`, autoRelaunch: false };
-	if (/\b(rate limit|quota|credits exhausted|usage limit|too many requests|429)\b/i.test(tail)) {
-		return { summary: `suspected-stuck: provider quota/rate limit detected: ${compactTail}`, autoRelaunch: false };
-	}
-	if (/\b(auth|login|oauth|api key|not authenticated|credentials?)\b/i.test(tail)) {
-		return { summary: `suspected-stuck: authentication/credential prompt detected: ${compactTail}`, autoRelaunch: false };
-	}
-	if (/\b(error|exception|traceback|failed|command not found|no such file|permission denied)\b/i.test(tail)) {
-		return { summary: `suspected-stuck: error output detected: ${compactTail}`, autoRelaunch: false };
-	}
-	if (/(^|\n)\s*(?:[\w.@-]+[:][^\n]*[$#%❯]|[$#%❯])\s*$/m.test(tail)) {
-		return { summary: `suspected-stuck: agent appears to have dropped to a shell prompt: ${compactTail}`, autoRelaunch: true };
-	}
-	return { summary: `suspected-stuck: no pane activity for ${STUCK_AFTER_MS / 60000}m; latest output: ${compactTail || "(no output captured)"}`, autoRelaunch: false };
+	return tail.replace(/\s+/g, " ").slice(-700) || "(no output captured)";
 }
 
 async function pollPanePeeks(run: GaudRunState) {
@@ -696,11 +787,6 @@ async function pollPanePeeks(run: GaudRunState) {
 				if (worker.status === "stuck") worker.status = "working";
 			}
 			worker.lastPeek = peek;
-			const permission = permissionPromptSummary(peek);
-			if (permission && !["done", "failed"].includes(worker.status)) {
-				worker.status = "waiting-permission";
-				worker.summary = `permission prompt: ${permission}`;
-			}
 		}
 	}
 }
@@ -773,23 +859,33 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 		const preStuck = new Set(Object.values(activeRun.workers).filter((w) => w.status === "stuck").map((w) => w.id));
 		markStuckWorkers(activeRun);
 		for (const worker of Object.values(activeRun.workers)) {
-			if (worker.status === "dead" && (worker.restartCount ?? 0) < 1) {
-				try { ctx.ui.notify(`Worker ${worker.id} pane died; relaunching once with the same prompt.`, "error"); } catch { /* stale ctx */ }
-				await restartWorker(pi, ctx, worker.id, false);
-				continue;
-			}
 			if (worker.status === "stuck" && (!preStuck.has(worker.id) || Date.now() - (worker.stuckNotifiedAt ?? 0) > 60_000)) {
 				worker.stuckNotifiedAt = Date.now();
 				const cmd = tmuxWorkerViewCommand(activeRun, worker);
-				const diagnosis = stuckDiagnosis(worker);
-				worker.summary = diagnosis.summary;
+				const lastOutput = (worker.lastPeek ?? "").split("\n").slice(-20).join("\n");
+				const socket = activeRun.tmuxSocket;
+				const paneId = worker.paneId ?? "";
+				const captureCmd = paneId
+					? `tmux -L ${socket} capture-pane -p -t ${paneId} -S -80`
+					: `tmux -L ${socket} list-panes -a`;
+				const sendKeysCmd = paneId
+					? `tmux -L ${socket} send-keys -t ${paneId} "YOUR_INPUT" Enter`
+					: "";
 				try {
-					pi.sendUserMessage(`GAUDMODE waiting-user role=${worker.role || "Implementer"} milestone=M1 workstream=${worker.workstream || worker.id} summary=${diagnosis.summary}`, { deliverAs: "followUp" });
+					pi.sendUserMessage(
+						`GAUDMODE stuck role=${worker.role || "Implementer"} milestone=${activeRun.currentMilestone ?? "M1"} workstream=${worker.workstream || worker.id} workerId=${worker.id} agent=${worker.agent}\n\nWorker ${worker.id} (${worker.agent}) has had no activity for ${STUCK_AFTER_MS / 60000}m. Investigate the pane output below and decide: unblock via tmux send-keys, restart via /gaud-restart, or ask the user.\n\n${paneId ? `Capture latest output:\n  ${captureCmd}\nSend input to pane:\n  ${sendKeysCmd}\n` : ""}Restart: /gaud-restart ${worker.id}\n\nDo NOT run gaud-poll or gaud-mode skill commands — the Pi extension owns all polling.\n\nLast pane output:\n${lastOutput}`,
+						{ deliverAs: "followUp" },
+					);
 				} catch { /* stale ctx */ }
-				try { ctx.ui.notify(`Worker ${worker.id} is stuck.\n${diagnosis.summary}\n\n${diagnosis.autoRelaunch ? "Auto-relaunching once because this looks like a shell-drop." : `Use dashboard key s or /gaud-restart ${worker.id} to relaunch after reviewing.`}\n\nJump to pane:\n${cmd}`, "error"); } catch { /* stale ctx */ }
-				if (diagnosis.autoRelaunch && (worker.restartCount ?? 0) < 1) {
-					await restartWorker(pi, ctx, worker.id, false);
-				}
+				try { ctx.ui.notify(`Worker ${worker.id} (${worker.agent}) stuck — no activity for ${STUCK_AFTER_MS / 60000}m.\nJump to pane:\n${cmd}`, "warning"); } catch { /* stale ctx */ }
+			}
+			if (worker.status === "dead") {
+				try {
+					pi.sendUserMessage(
+						`GAUDMODE dead role=${worker.role || "Implementer"} milestone=${activeRun.currentMilestone ?? "M1"} workstream=${worker.workstream || worker.id} workerId=${worker.id} agent=${worker.agent}\n\nWorker ${worker.id} (${worker.agent}) pane has died. Decide: restart via /gaud-restart ${worker.id} or continue without it.\n\nDo NOT run gaud-poll or gaud-mode skill commands — the Pi extension owns all polling.`,
+						{ deliverAs: "followUp" },
+					);
+				} catch { /* stale ctx */ }
 			}
 			if (worker.status === "waiting-permission" && worker.summary && Date.now() - (worker.permissionNotifiedAt ?? 0) > 60_000) {
 				worker.permissionNotifiedAt = Date.now();
@@ -940,6 +1036,7 @@ async function restartWorker(pi: ExtensionAPI, ctx: ExtensionContext, workerId: 
 	worker.lastEventAt = Date.now();
 	worker.lastOutputAt = undefined;
 	worker.lastPeek = undefined;
+	worker.trustAutoRespondedAt = undefined;
 	activeRun.status = "running";
 	await persistRun(pi);
 	refreshUi(ctx);
@@ -1318,31 +1415,30 @@ async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: stri
 }
 
 async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: string) {
-	const parsed = parseArgs(args);
-	const taskArg = parsed.task && parsed.task !== "doctor" && parsed.task !== "status" ? parsed.task : "";
-	const taskArgPath = taskArg ? (path.isAbsolute(taskArg) ? taskArg : path.join(ctx.cwd, taskArg)) : "";
-	const taskArgLooksLikePath = Boolean(taskArg && (existsSync(taskArgPath) || /\.(md|markdown|txt)$/i.test(taskArg) || taskArg.includes("/")));
-	const seededFocus = taskArgLooksLikePath ? undefined : taskArg || undefined;
-	const sourcePath = taskArgLooksLikePath ? taskArg : "PLAN.md";
-	const absoluteSourcePath = path.isAbsolute(sourcePath) ? sourcePath : path.join(ctx.cwd, sourcePath);
+	if (planningInFlight) return;
+	planningInFlight = true;
+	try {
+		const parsed = parseArgs(args);
+		const { taskArgPath, seededFocus, sourcePath, absoluteSourcePath, missingExplicitPath } = await resolvePlanningSource(ctx.cwd, parsed.task);
 	let planText = "";
 	let focus: string | undefined = seededFocus;
 	let sourceLabel = sourcePath;
+
+	if (missingExplicitPath) {
+		ctx.ui.notify(`Gaud plan file not found: ${taskArgPath}. Put the markdown plan in this repo, pass an absolute path, or run /gaud with no args to use discovered local plans.`, "error");
+		return;
+	}
 
 	if (existsSync(absoluteSourcePath)) {
 		if (seededFocus) {
 			planText = await readFile(absoluteSourcePath, "utf8");
 			ctx.ui.notify(`Using existing ${sourcePath} as context and auto-generating the current milestone from your request.`, "info");
 		} else {
-			const useExisting = await ctx.ui.confirm("Gaud plan source", `Use existing ${sourcePath} as the planning source? Choose No to start from a one-line request.`);
-			if (useExisting) {
-				planText = await readFile(absoluteSourcePath, "utf8");
-				focus = await ctx.ui.input("Gaud plan focus", "What milestone/slice should workers implement next?");
-				if (!focus) return;
-			}
+			planText = await readFile(absoluteSourcePath, "utf8");
+			focus = inferPlanFocus(planText, sourcePath);
+			ctx.ui.notify(`Using existing ${sourcePath} as the Gaud planning source.`, "info");
 		}
 	}
-
 	if (!planText) {
 		const generated = await createPlanByInterview(ctx, seededFocus);
 		if (!generated) return;
@@ -1383,6 +1479,9 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 	const launch = await ctx.ui.confirm("Launch Gaud workers?", `Plan written to ${outPath}\n\nLaunch these assigned workers now?\n\n${workerPlans.map((plan) => `- ${plan.id}: ${plan.role} via ${plan.agent}`).join("\n")}`);
 	if (launch) await launchRun(pi, ctx, `${approvedFocus}\n\nExecution plan: ${outPath}`, workerPlans.map((plan) => plan.agent), parsed.fake, "User approved reviewed Gaud plan.", workerPlans);
 	else ctx.ui.notify(`Gaud plan written: ${outPath}`, "info");
+	} finally {
+		planningInFlight = false;
+	}
 }
 
 async function showPeek(ctx: ExtensionContext, workerId?: string) {
@@ -1441,15 +1540,28 @@ class GaudDashboardComponent implements Component {
 		this.done();
 	}
 
+	private moveDashboard(dx: number, dy: number) {
+		dashboardOffset = { x: dashboardOffset.x + dx, y: dashboardOffset.y + dy };
+	}
+
+	private resetDashboardPosition() {
+		dashboardOffset = { x: 0, y: 0 };
+	}
+
 	private notifyAttach(worker?: WorkerState) {
 		if (!activeRun) return;
 		this.ctx.ui.notify(worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun), "info");
 	}
 
-	handleInput(data: string): void {
+		handleInput(data: string): void {
 		const workers = this.workers();
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) return this.close();
-		if (matchesKey(data, "down") || matchesKey(data, "j")) this.selected = Math.min(workers.length - 1, this.selected + 1);
+		if (matchesKey(data, "shift+left") || matchesKey(data, "alt+left") || data === "H") this.moveDashboard(-4, 0);
+		else if (matchesKey(data, "shift+right") || matchesKey(data, "alt+right") || data === "L") this.moveDashboard(4, 0);
+		else if (matchesKey(data, "shift+up") || matchesKey(data, "alt+up") || data === "K") this.moveDashboard(0, -2);
+		else if (matchesKey(data, "shift+down") || matchesKey(data, "alt+down") || data === "J") this.moveDashboard(0, 2);
+		else if (data === "0") this.resetDashboardPosition();
+		else if (matchesKey(data, "down") || matchesKey(data, "j")) this.selected = Math.min(workers.length - 1, this.selected + 1);
 		else if (matchesKey(data, "up") || matchesKey(data, "k")) this.selected = Math.max(0, this.selected - 1);
 		else if (matchesKey(data, "g")) this.selected = 0;
 		else if (data === "G") this.selected = Math.max(0, workers.length - 1);
@@ -1464,7 +1576,13 @@ class GaudDashboardComponent implements Component {
 			if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
 		}
 		else if (matchesKey(data, "a")) this.notifyAttach();
-		else if (matchesKey(data, "return") || matchesKey(data, "v")) this.notifyAttach(this.selectedWorker());
+		else if (matchesKey(data, "return") || matchesKey(data, "v")) {
+			const worker = this.selectedWorker();
+			const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
+			const ctx = this.ctx;
+			this.close();
+			if (cmd) ctx.ui.notify(cmd, "info");
+		}
 		else if (matchesKey(data, "y")) {
 			const worker = this.selectedWorker();
 			if (activeRun) this.ctx.ui.notify(worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun), "info");
@@ -1482,7 +1600,7 @@ class GaudDashboardComponent implements Component {
 		lines.push(border(`╭${"─".repeat(innerW)}╮`));
 		lines.push(line(th.fg("accent", "Gaud Dashboard") + `  ${activeRun ? activeRun.id : "no active run"}`));
 		lines.push(line(activeRun ? `${statusText()}` : "No active Gaud run."));
-		lines.push(line("keys: ↑↓/j/k select · Enter/v tmux · p output · s relaunch · x cancel · r refresh · q close"));
+		lines.push(line("keys: ↑↓/j/k select · H/J/K/L move · 0 reset · Enter/v tmux · p output · s relaunch · x cancel · q/Esc close → back to input"));
 		lines.push(line());
 		if (activeRun) {
 			const workers = this.workers();
@@ -1543,18 +1661,31 @@ function showGaudDashboard(pi: ExtensionAPI, ctx: ExtensionContext) {
 	if (dashboardOpen) {
 		dashboardHandle?.setHidden?.(false);
 		dashboardHandle?.focus?.();
+		refreshUi(ctx);
 		return;
 	}
 	dashboardOpen = true;
+	ctx.ui.setWidget("gaud", undefined);
+	refreshUi(ctx);
+	const overlayOptions = (): OverlayOptions => ({
+		anchor: "right-center",
+		width: "60%",
+		minWidth: 56,
+		maxHeight: "75%",
+		margin: 1,
+		offsetX: dashboardOffset.x,
+		offsetY: dashboardOffset.y,
+	});
 	void ctx.ui.custom<void>((tui, theme, _keybindings, done) => new GaudDashboardComponent(tui, theme, done, pi, ctx), {
 		overlay: true,
-		overlayOptions: { anchor: "right-center", width: "60%", minWidth: 56, maxHeight: "75%", margin: 1 },
+		overlayOptions,
 		onHandle: (handle) => {
 			dashboardHandle = handle;
 		},
 	}).finally(() => {
 		dashboardOpen = false;
 		dashboardHandle = undefined;
+		refreshUi(ctx);
 	});
 }
 
@@ -1583,6 +1714,19 @@ export default function gaudExtension(pi: ExtensionAPI) {
 		extensionActive = true;
 		lastCtx = ctx;
 		refreshUi(ctx);
+	});
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (!activeRun || activeRun.status !== "running") return;
+		const workers = Object.values(activeRun.workers);
+		const stuck = workers.filter((w) => ["stuck", "waiting-user", "waiting-permission", "dead"].includes(w.status));
+		const done = workers.filter((w) => w.status === "done").length;
+		const workerSummary = workers.map((w) => `  ${workerStatusSymbol(w.status)} ${w.id} (${w.agent}/${w.role}): ${w.status}${w.summary ? ` — ${w.summary.slice(0, 80)}` : ""}`).join("\n");
+		const stuckBlock = stuck.length > 0 ? `\n⚠ NEEDS ATTENTION: ${stuck.map((w) => w.id).join(", ")}. Investigate in tmux or use /gaud-peek ${stuck[0]!.id}.` : "";
+		const dashboardHint = activeRun && ctx.hasUI ? `\nDashboard: Ctrl+Shift+G or Ctrl+D. Close with q or Escape.` : "";
+		return {
+			systemPrompt: event.systemPrompt + `\n\n[GAUD ACTIVE — ${activeRun.id}]\nStatus: ${activeRun.status} · ${done}/${workers.length} workers done · poll: ${pollHealthText()}\nTask: ${activeRun.task}\nMilestone: ${activeRun.currentMilestone ?? "M1"}\nWorkers:\n${workerSummary}${stuckBlock}${dashboardHint}\n\nCallbacks arrive as GAUDMODE messages. Use tmux commands from follow-up messages to investigate stuck workers. Do NOT run gaud-poll or gaud-mode skill commands — the extension owns all polling.`,
+		};
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -1620,14 +1764,21 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			}
 			const parsed = parseArgs(explicitTask);
 			if (parsed.fake) await launchRun(pi, ctx, parsed.task, parsed.agents, true, "User explicitly requested fake Gaud smoke run.");
-			else await runPlanningWizard(pi, ctx, explicitTask || "PLAN.md");
+			else await runPlanningWizard(pi, ctx, explicitTask);
 			return { action: "handled" as const };
 		}
 
-		// Non-explicit requests should flow to the foreground orchestrator model.
-		// The model has gaud_start_run guidance and can decide whether to ask the
-		// user about a Gaud plan. Avoid extension-level heuristic popups here:
-		// small tasks should stay serial, and borderline tasks need model judgment.
+		if (!activeRun && looksParallelizable(event.text)) {
+			const useGaud = await ctx.ui.confirm(
+				"Gaud — parallel agent orchestration",
+				"This looks like a multi-part task. Gaud can plan it across parallel agents (design, engineering, implementation, review).\n\nLaunch Gaud planning wizard?",
+			);
+			if (useGaud) {
+				await runPlanningWizard(pi, ctx, event.text);
+				return { action: "handled" as const };
+			}
+		}
+
 		return { action: "continue" as const };
 	});
 
@@ -1640,19 +1791,31 @@ export default function gaudExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerShortcut("ctrl+d", {
+		description: "Focus/open Gaud dashboard (alternative)",
+		handler: async (ctx) => {
+			if (activeRun) await pollOnce(pi, ctx);
+			refreshUi(ctx);
+			showGaudDashboard(pi, ctx);
+		},
+	});
+
 	pi.registerTool({
 		name: "gaud_start_run",
 		label: "Start Gaud Run",
 		description: "Create and optionally launch a Gaud milestone plan for work that benefits from multiple agents.",
-		promptSnippet: "Use Gaud only after you reason that the task is complex/parallelizable, or when the user explicitly asks for gaud/god mode.",
+		promptSnippet: "Default bias: use Gaud for any task with 2+ independent workstreams, multi-file changes, or milestone-level scope. Only skip Gaud for single-file fixes, typos, or truly trivial edits.",
 		promptGuidelines: [
-			"First decide yourself whether Gaud is warranted. Use normal serial editing for small/simple/single-file tasks.",
-			"For complex work with separable workstreams, multiple modules, uncertain architecture, or milestone-based delivery, ask the user whether they want to break it into a Gaud plan before calling this tool unless they explicitly requested Gaud.",
-			"When called, Gaud will auto-generate the PRD, milestone, tickets, and worker assignments from the user's request and should only ask the user for material clarifications or launch approval.",
-			"Do not call gaud_start_run just because a request contains words like build/fix/update; use judgment about scope and parallelism.",
+			"Default to Gaud. Use it when the task: spans 2+ modules/files/directories, has separable workstreams, involves multiple concerns (design + implementation + review), or feels like a milestone rather than a micro-task.",
+			"For complex work — call gaud_start_run proactively. Gaud auto-generates the PRD, milestones, tickets, and worker assignments. You only need to ask the user for material clarifications or launch approval.",
+			"Skip Gaud ONLY for: single-file typo fixes, one-line config changes, simple questions/explanations, or any task you could complete in one serial turn.",
+			"If the user explicitly requested Gaud and did not provide a fresh task, call gaud_start_run with an empty task so Gaud can discover existing markdown plans before asking new questions.",
+			"Gaud pre-fills agent roles from installed CLIs, generates the plan template, and presents it for review. Don't over-explain what Gaud will do — just call the tool and let the extension handle the planning wizard.",
+			"IMPORTANT: Do NOT invoke the gaud-mode skill. The Pi extension is the complete gaud implementation for this session. The gaud-mode skill is for standalone CLI environments and will conflict with the extension.",
+			"After a run starts you will receive GAUDMODE follow-up messages automatically. When a worker is stuck the message includes exact tmux commands to investigate and unblock — use those directly. Never run gaud-poll, gaud-tmux-layout, or any $_GAUD_DIR script.",
 		],
 		parameters: Type.Object({
-			task: Type.String({ description: "The user's task to parallelize." }),
+			task: Type.String({ description: "The user's task to parallelize, an explicit plan path, or empty when Gaud should discover an existing markdown plan." }),
 			reason: Type.String({ description: "Why this task benefits from Gaud parallelization." }),
 			agents: Type.Optional(Type.Array(Type.String(), { description: "Agent CLI names to launch, e.g. claude, opencode, antigravity." })),
 			fake: Type.Optional(Type.Boolean({ description: "Launch fake bash workers for smoke testing." })),
@@ -1717,7 +1880,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				await launchRun(pi, ctx, parsed.task, parsed.agents, true, "User ran /gaud fake smoke run.");
 				return;
 			}
-			await runPlanningWizard(pi, ctx, parsed.task === "plan" ? "PLAN.md" : (args.trim() || "PLAN.md"));
+			await runPlanningWizard(pi, ctx, parsed.task === "plan" ? "PLAN.md" : args.trim());
 		},
 	});
 
