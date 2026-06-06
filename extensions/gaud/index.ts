@@ -1803,24 +1803,51 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "gaud_start_run",
 		label: "Start Gaud Run",
-		description: "Create and optionally launch a Gaud milestone plan for work that benefits from multiple agents.",
-		promptSnippet: "Default bias: use Gaud for any task with 2+ independent workstreams, multi-file changes, or milestone-level scope. Only skip Gaud for single-file fixes, typos, or truly trivial edits.",
+		description: "Launch parallel agent workers for a task. You decide how many workers, their roles, and what each should do — no hard-coded templates.",
+		promptSnippet: "Default bias: use Gaud for any task with 2+ independent workstreams, multi-file changes, or milestone-level scope. You decide the worker count and roles dynamically based on the task.",
 		promptGuidelines: [
-			"Default to Gaud. Use it when the task: spans 2+ modules/files/directories, has separable workstreams, involves multiple concerns (design + implementation + review), or feels like a milestone rather than a micro-task.",
-			"For complex work — call gaud_start_run proactively. Gaud auto-generates the PRD, milestones, tickets, and worker assignments. You only need to ask the user for material clarifications or launch approval.",
-			"Skip Gaud ONLY for: single-file typo fixes, one-line config changes, simple questions/explanations, or any task you could complete in one serial turn.",
-			"If the user explicitly requested Gaud and did not provide a fresh task, call gaud_start_run with an empty task so Gaud can discover existing markdown plans before asking new questions.",
-			"Gaud pre-fills agent roles from installed CLIs, generates the plan template, and presents it for review. Don't over-explain what Gaud will do — just call the tool and let the extension handle the planning wizard.",
-			"IMPORTANT: Do NOT invoke the gaud-mode skill. The Pi extension is the complete gaud implementation for this session. The gaud-mode skill is for standalone CLI environments and will conflict with the extension.",
-			"After a run starts you will receive GAUDMODE follow-up messages automatically. When a worker is stuck the message includes exact tmux commands to investigate and unblock — use those directly. Never run gaud-poll, gaud-tmux-layout, or any $_GAUD_DIR script.",
+			"You are the orchestrator. Decide: how many workers does this task need? What role should each play? What files should each focus on? What constitutes done for each?",
+			"Small task (single file, simple fix) → call gaud_start_run with 1-2 workers, or handle it yourself without Gaud.",
+			"Medium task (multiple files, one concern) → 2-3 workers: e.g. investigator + implementer, or implementer + reviewer.",
+			"Large task (multiple modules, design + implementation + review) → 3-5 workers: e.g. planner + implementer(s) + reviewer.",
+			"Extra large (full feature, architecture changes) → 4-7 workers with specialized roles you define.",
+			"Each worker spec needs: agent (CLI name like claude/codex/gemini/opencode), role (brief label), objective (what to do), files (primary files/areas), doneCriteria (how to know it's done).",
+			"Call gaud_start_run with an empty task to discover existing plan files. Call it with a task description and worker specs to launch directly.",
+			"IMPORTANT: Do NOT invoke the gaud-mode skill. The Pi extension is the complete gaud implementation. The gaud-mode skill conflicts with the extension.",
+			"After a run starts you will receive GAUDMODE follow-up messages automatically. Workers report their status — stuck workers include tmux commands to investigate.",
 		],
 		parameters: Type.Object({
-			task: Type.String({ description: "The user's task to parallelize, an explicit plan path, or empty when Gaud should discover an existing markdown plan." }),
+			task: Type.String({ description: "The user's task to parallelize, an explicit plan path, or empty to discover existing plans." }),
 			reason: Type.String({ description: "Why this task benefits from Gaud parallelization." }),
-			agents: Type.Optional(Type.Array(Type.String(), { description: "Agent CLI names to launch, e.g. claude, opencode, antigravity." })),
+			workers: Type.Optional(Type.Array(Type.Object({
+				agent: Type.String({ description: "Agent CLI to use: claude, codex, gemini, opencode, antigravity, etc." }),
+				role: Type.String({ description: "Worker role label: e.g. Implementer, Reviewer, Investigator, Designer, Architect, Tester." }),
+				objective: Type.String({ description: "What this worker should accomplish. Be specific." }),
+				files: Type.Array(Type.String(), { description: "Primary files or file patterns this worker should focus on." }),
+				doneCriteria: Type.Array(Type.String(), { description: "How to know this worker is done. Concrete, verifiable." }),
+			}), { description: "Worker assignments you determine. Omit to use the planning wizard." })),
+			agents: Type.Optional(Type.Array(Type.String(), { description: "Agent CLI names (shorthand for simple cases)." })),
 			fake: Type.Optional(Type.Boolean({ description: "Launch fake bash workers for smoke testing." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (params.workers?.length) {
+				const workerPlans: WorkerPlan[] = params.workers.map((w, i) => ({
+					id: `${slugify(w.role)}-${i + 1}`,
+					agent: w.agent,
+					role: w.role as GaudRole,
+					objective: w.objective,
+					files: w.files,
+					doneCriteria: w.doneCriteria,
+				}));
+				const allAgents = [...new Set(workerPlans.map((p) => p.agent))];
+				const basePlan = `# Gaud Execution Plan\n\n## Task\n${params.task}\n\n## Worker Assignments\n\n${workerPlans.map((p) => `### ${p.id} — ${p.role} (${p.agent})\n\n**Objective:** ${p.objective}\n\n**Files:** ${p.files.join(", ")}\n\n**Done criteria:**\n${p.doneCriteria.map((c) => `- ${c}`).join("\n")}`).join("\n\n")}`;
+				const planDir = path.join(ctx.cwd, ".gaud", "plans");
+				await mkdir(planDir, { recursive: true });
+				const planPath = path.join(planDir, `${makeRunId()}-plan.md`);
+				await writeFile(planPath, basePlan, "utf8");
+				await launchRun(pi, ctx, `${params.task}\n\nExecution plan: ${planPath}`, allAgents, params.fake ?? false, params.reason, workerPlans);
+				return { content: [{ type: "text", text: statusText() }], details: { run: activeRun, reason: params.reason, workers: workerPlans.length } };
+			}
 			const agentArg = params.agents?.length ? ` --agents ${params.agents.join(",")}` : "";
 			const fakeArg = params.fake ? " --fake" : "";
 			await runPlanningWizard(pi, ctx, `${agentArg}${fakeArg} ${params.task}`.trim());
