@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayOptions, TUI } from "@earendil-works/pi-tui";
-import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, Editor, Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -1836,6 +1836,114 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			const fakeArg = params.fake ? " --fake" : "";
 			await runPlanningWizard(pi, ctx, `${agentArg}${fakeArg} ${params.task}`.trim());
 			return { content: [{ type: "text", text: activeRun ? statusText() : "Gaud plan flow completed without launching workers." }], details: { run: activeRun, reason: params.reason } };
+		},
+	});
+
+	pi.registerTool({
+		name: "ask_user",
+		label: "Ask User",
+		description: "Ask the user a clarifying question with suggested options and your recommendation. Use when you need user input to proceed — never guess when you can ask.",
+		promptSnippet: "When you need a decision from the user, call ask_user with analyzed options and your recommendation. The user can pick an option or type their own.",
+		promptGuidelines: [
+			"Use ask_user for: scoping decisions, implementation approach choices, priority tradeoffs, clarification of ambiguous requirements.",
+			"Each option should have a label (1-5 words) and a description explaining the tradeoffs.",
+			"Always include a recommendation — mark it clearly in the question text like 'Recommended: Option B'.",
+			"Keep options to 2-5. More than 5 = you haven't narrowed the choices enough.",
+			"Do NOT use ask_user for discoverable facts (explore the codebase first). Ask for preferences, tradeoffs, and decisions only.",
+			"The last option is always 'Other — type my own answer' for custom input. Don't add it yourself — the UI handles it.",
+		],
+		parameters: Type.Object({
+			question: Type.String({ description: "The question to ask the user. Be specific about what decision is needed." }),
+			options: Type.Array(Type.Object({
+				label: Type.String({ description: "Short option label (1-5 words)" }),
+				description: Type.String({ description: "What this option means, tradeoffs, when it's the right choice" }),
+			}), { description: "2-5 analyzed options. Put your recommended option first." }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!ctx.hasUI) {
+				return { content: [{ type: "text", text: "Cannot ask question: no interactive UI available." }], details: {} };
+			}
+			const allOptions = [...params.options, { label: "Other — type my own answer", description: "Custom answer" }];
+			const result = await ctx.ui.custom<{ answer: string; wasCustom: boolean; index?: number } | null>(
+				(tui, theme, _kb, done) => {
+					let optionIndex = 0;
+					let editMode = false;
+					let cachedLines: string[] | undefined;
+					const editor = new Editor(tui, {
+						borderColor: (s) => theme.fg("accent", s),
+						selectList: { selectedPrefix: (s) => s, selectedText: (s) => s, description: (s) => s, scrollInfo: (s) => s, noMatch: (s) => s },
+					});
+
+					editor.onSubmit = (value) => {
+						const trimmed = value.trim();
+						if (trimmed) { done({ answer: trimmed, wasCustom: true }); }
+						else { editMode = false; editor.setText(""); cachedLines = undefined; tui.requestRender(); }
+					};
+
+					function handleInput(data: string) {
+						if (editMode) {
+							if (matchesKey(data, Key.escape)) { editMode = false; editor.setText(""); cachedLines = undefined; tui.requestRender(); return; }
+							editor.handleInput(data);
+							cachedLines = undefined; tui.requestRender();
+							return;
+						}
+						if (matchesKey(data, Key.up)) { optionIndex = Math.max(0, optionIndex - 1); cachedLines = undefined; tui.requestRender(); return; }
+						if (matchesKey(data, Key.down)) { optionIndex = Math.min(allOptions.length - 1, optionIndex + 1); cachedLines = undefined; tui.requestRender(); return; }
+						if (matchesKey(data, Key.enter)) {
+							const selected = allOptions[optionIndex];
+							if (selected === allOptions[allOptions.length - 1]) { editMode = true; cachedLines = undefined; tui.requestRender(); }
+							else { done({ answer: selected.label, wasCustom: false, index: optionIndex + 1 }); }
+							return;
+						}
+						if (matchesKey(data, Key.escape)) done(null);
+					}
+
+					function render(width: number): string[] {
+						if (cachedLines) return cachedLines;
+						const lines: string[] = [];
+						const add = (s: string) => lines.push(truncateToWidth(s, width));
+						const innerW = Math.max(20, width - 2);
+						const pad = (s: string) => truncateToWidth(s, innerW, "…", true);
+						const border = (s: string) => theme.fg("border", s);
+
+						lines.push(border(`╭${"─".repeat(innerW)}╮`));
+						add(border(theme.fg("accent", ` ${params.question}`)));
+						lines.push(border(""));
+						for (let i = 0; i < allOptions.length; i++) {
+							const opt = allOptions[i];
+							const isLast = i === allOptions.length - 1;
+							const selected = i === optionIndex;
+							const marker = selected ? theme.fg("accent", "▸") : " ";
+							const label = isLast ? theme.fg("dim", opt.label) : selected ? theme.fg("accent", opt.label) : opt.label;
+							const desc = isLast ? theme.fg("dim", opt.description) : selected ? theme.fg("accent", opt.description) : theme.fg("muted", opt.description);
+							lines.push(border(`${marker} ${label}`));
+							if (opt.description) lines.push(border(`   ${desc}`));
+						}
+						lines.push(border(""));
+						if (editMode) {
+							lines.push(border(theme.fg("muted", " Your answer:")));
+							for (const line of editor.render(innerW - 2)) {
+								lines.push(border(` ${line}`));
+							}
+							lines.push(border(theme.fg("dim", " Enter to submit · Esc to go back")));
+						} else {
+							lines.push(border(theme.fg("dim", " ↑↓ navigate · Enter to select · Esc to cancel")));
+						}
+						lines.push(border(`╰${"─".repeat(innerW)}╯`));
+						cachedLines = lines;
+						return lines;
+					}
+
+					return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
+				},
+			);
+			if (!result) {
+				return { content: [{ type: "text", text: "User cancelled." }], details: { cancelled: true } };
+			}
+			if (result.wasCustom) {
+				return { content: [{ type: "text", text: `User wrote: ${result.answer}` }], details: { answer: result.answer, custom: true } };
+			}
+			return { content: [{ type: "text", text: `User selected: ${result.index}. ${result.answer}` }], details: { answer: result.answer, index: result.index } };
 		},
 	});
 
