@@ -1457,12 +1457,8 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 	await mkdir(planDir, { recursive: true });
 	const outPath = path.join(planDir, `${makeRunId()}-plan.md`);
 	const generatedMarkdown = renderPlanMarkdown(approvedFocus, sourceLabel, workerPlans, planText);
-	const reviewedMarkdown = await ctx.ui.editor("Review/edit Gaud execution plan before launch", generatedMarkdown);
-	if (!reviewedMarkdown) return;
-	await writeFile(outPath, reviewedMarkdown, "utf8");
-	const launch = await ctx.ui.confirm("Launch Gaud workers?", `Plan written to ${outPath}\n\nLaunch these assigned workers now?\n\n${workerPlans.map((plan) => `- ${plan.id}: ${plan.role} via ${plan.agent}`).join("\n")}`);
-	if (launch) await launchRun(pi, ctx, `${approvedFocus}\n\nExecution plan: ${outPath}`, workerPlans.map((plan) => plan.agent), parsed.fake, "User approved reviewed Gaud plan.", workerPlans);
-	else ctx.ui.notify(`Gaud plan written: ${outPath}`, "info");
+	await writeFile(outPath, generatedMarkdown, "utf8");
+	await launchRun(pi, ctx, `${approvedFocus}\n\nExecution plan: ${outPath}`, workerPlans.map((plan) => plan.agent), parsed.fake, "Auto-launched from planning wizard.", workerPlans);
 	} finally {
 		planningInFlight = false;
 	}
