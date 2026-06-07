@@ -830,7 +830,13 @@ async function pollEvents(pi: ExtensionAPI, ctx: ExtensionContext, run: GaudRunS
 				const milestone = String(event.milestone ?? "M1");
 				const workstream = String(event.workstream ?? workerId);
 				const summary = String(event.summary ?? event.question ?? "").replace(/\s+/g, " ").trim();
-				const text = `GAUDMODE ${type} role=${role} milestone=${milestone} workstream=${workstream} summary=${summary}`;
+				let text = `GAUDMODE ${type} role=${role} milestone=${milestone} workstream=${workstream} summary=${summary}`;
+				if (type === "failed" && worker?.lastPeek) {
+					const tail = worker.lastPeek.split("\n").slice(-30).join("\n");
+					text += `\n\nFailed worker output (last 30 lines):\n${tail}`;
+					const failLog = path.join(run.runDir, "workers", workerId, "failure.log");
+					await writeFile(failLog, `${new Date().toISOString()} FAILED\nSummary: ${summary}\n\nFull output:\n${worker.lastPeek}\n`, "utf8");
+				}
 				pi.sendUserMessage(text, { deliverAs: "followUp" });
 			} else {
 				pi.sendMessage({ customType: "gaud-event", content: `Gaud event ${type} from ${workerId}`, display: true, details: event });
@@ -2034,6 +2040,30 @@ export default function gaudExtension(pi: ExtensionAPI) {
 		description: "Peek tmux pane output for all workers or one worker id",
 		handler: async (args, ctx) => {
 			await showPeek(ctx, args.trim() || undefined);
+		},
+	});
+
+	pi.registerCommand("gaud-logs", {
+		description: "Show failure logs and recent pane output for debugging",
+		handler: async (_args, ctx) => {
+			if (!activeRun) {
+				ctx.ui.notify("No active Gaud run.", "info");
+				return;
+			}
+			const workers = Object.values(activeRun.workers);
+			const failed = workers.filter((w) => w.status === "failed" || w.status === "dead");
+			const lines: string[] = [`Gaud ${activeRun.id} — ${failed.length} failed/dead workers`];
+			for (const w of failed) {
+				lines.push(`\n--- ${w.id} (${w.agent}/${w.role}) — ${w.status} ---`);
+				if (w.summary) lines.push(`Summary: ${w.summary}`);
+				const failLog = path.join(activeRun.runDir, "workers", w.id, "failure.log");
+				try { const logContent = await readFile(failLog, "utf8"); lines.push(`Failure log: ${logContent.slice(0, 2000)}`); } catch { /* no log */ }
+				if (w.lastPeek) lines.push(`Last output:\n${w.lastPeek.split("\n").slice(-20).join("\n")}`);
+			}
+			if (failed.length === 0) {
+				lines.push("\nNo failures. Workers are: " + workers.map((w) => `${w.id}:${w.status}`).join(", "));
+			}
+			ctx.ui.notify(lines.join("\n").slice(-7000), "info");
 		},
 	});
 
