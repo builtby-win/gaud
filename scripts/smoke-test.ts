@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 
-const result = spawnSync("pi", ["-e", ".", "--no-session", "-p", "/gaud-status"], {
+const result = spawnSync("pi", ["--no-extensions", "-e", ".", "--no-session", "-p", "/gaud-status"], {
 	cwd: process.cwd(),
 	encoding: "utf8",
 	stdio: "pipe",
