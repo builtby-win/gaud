@@ -4,7 +4,7 @@ import { matchesKey, truncateToWidth, Editor, Key } from "@earendil-works/pi-tui
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
@@ -101,6 +101,7 @@ type WorkerState = {
 	permissionNotifiedAt?: number;
 	stuckNotifiedAt?: number;
 	trustAutoRespondedAt?: number;
+	exitRecordedAt?: number;
 };
 
 type PlanMilestone = {
@@ -159,8 +160,17 @@ function summarizeForTrace(text: string): string {
 }
 
 function recordGaudTrace(phase: string, summary: string, details: string[] = []) {
-	gaudTraceEntries.push({ ts: Date.now(), phase, summary, details });
+	const entry = { ts: Date.now(), phase, summary, details };
+	gaudTraceEntries.push(entry);
 	while (gaudTraceEntries.length > MAX_GAUD_TRACE_ENTRIES) gaudTraceEntries.shift();
+
+	if (pollerLogPath) {
+		try {
+			appendFileSync(pollerLogPath, JSON.stringify(entry) + "\n");
+		} catch (e) {
+			// Fail silently for logging errors
+		}
+	}
 }
 
 function formatGaudTrace(limit = 20): string {
@@ -264,6 +274,7 @@ export function renderAskUserDialogLines(params: {
 type ExecResult = { stdout: string; stderr: string; code: number };
 
 let activeRun: GaudRunState | undefined;
+let pollerLogPath: string | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
 let uiTickTimer: NodeJS.Timeout | undefined;
 let extensionPi: ExtensionAPI | undefined;
@@ -686,6 +697,117 @@ async function readRunState(statePath: string): Promise<GaudRunState | undefined
 	}
 }
 
+const ACTIVE_RUN_STATUSES: RunStatus[] = ["starting", "running", "waiting-user"];
+
+function isActiveRunStatus(status: RunStatus | string | undefined): boolean {
+	return ACTIVE_RUN_STATUSES.includes(status as RunStatus);
+}
+
+function ensurePollerLogPath(run: GaudRunState): string {
+	pollerLogPath = path.join(run.runDir, "poller.log");
+	return pollerLogPath;
+}
+
+function workerStatusCountsForLog(run: GaudRunState): Record<string, number> {
+	const counts: Record<string, number> = {};
+	for (const worker of Object.values(run.workers)) {
+		counts[worker.status] = (counts[worker.status] ?? 0) + 1;
+	}
+	return counts;
+}
+
+function appendPollerLog(run: GaudRunState, event: string, details: Record<string, unknown> = {}) {
+	try {
+		appendFileSync(ensurePollerLogPath(run), `${JSON.stringify({
+			ts: new Date().toISOString(),
+			event,
+			runId: run.id,
+			status: run.status,
+			...details,
+		})}\n`);
+	} catch {
+		// Poller diagnostics must never break orchestration.
+	}
+}
+
+function workerDirFor(run: GaudRunState, worker: WorkerState): string {
+	return path.dirname(worker.logPath) || path.join(run.runDir, "workers", worker.id);
+}
+
+async function writeWorkerStatusFile(run: GaudRunState, worker: WorkerState) {
+	try {
+		await writeJson(path.join(workerDirFor(run, worker), "status.json"), {
+			ts: new Date().toISOString(),
+			runId: run.id,
+			workerId: worker.id,
+			agent: worker.agent,
+			role: worker.role,
+			status: worker.status,
+			paneId: worker.paneId,
+			paneIndex: worker.paneIndex,
+			pid: worker.pid,
+			lastEventAt: worker.lastEventAt,
+			lastOutputAt: worker.lastOutputAt,
+			summary: worker.summary,
+			restartCount: worker.restartCount ?? 0,
+		});
+	} catch {
+		// Worker status snapshots are diagnostic only.
+	}
+}
+
+async function writeWorkerExitFile(run: GaudRunState, worker: WorkerState, details: Record<string, unknown>) {
+	if (worker.exitRecordedAt) return;
+	worker.exitRecordedAt = Date.now();
+	try {
+		await writeJson(path.join(workerDirFor(run, worker), "exit.json"), {
+			ts: new Date(worker.exitRecordedAt).toISOString(),
+			runId: run.id,
+			workerId: worker.id,
+			agent: worker.agent,
+			role: worker.role,
+			paneId: worker.paneId,
+			status: worker.status,
+			...details,
+		});
+	} catch {
+		// Worker exit snapshots are diagnostic only.
+	}
+}
+
+async function writeAllWorkerStatusFiles(run: GaudRunState) {
+	await Promise.all(Object.values(run.workers).map((worker) => writeWorkerStatusFile(run, worker)));
+}
+
+async function reattachPaneLogs(run: GaudRunState) {
+	for (const worker of Object.values(run.workers)) {
+		if (!worker.paneId || ["done", "failed", "dead"].includes(worker.status)) continue;
+		const result = await tmux(run, ["pipe-pane", "-o", "-t", worker.paneId, `cat >> ${shellQuote(worker.logPath)}`]);
+		appendPollerLog(run, result.code === 0 ? "pane_log_reattached" : "pane_log_reattach_failed", {
+			workerId: worker.id,
+			paneId: worker.paneId,
+			logPath: worker.logPath,
+			error: result.code === 0 ? undefined : result.stderr.trim() || "tmux pipe-pane failed",
+		});
+	}
+}
+
+export async function findLatestActiveRun(cwd: string): Promise<GaudRunState | undefined> {
+	const runsDir = path.join(cwd, ".gaud", "runs");
+	try {
+		const states: GaudRunState[] = [];
+		for (const runId of await readdir(runsDir)) {
+			const state = await readRunState(path.join(runsDir, runId, "state.json"));
+			if (state && isActiveRunStatus(state.status)) states.push(state);
+		}
+		states.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+		return states[0];
+	} catch {
+		// .gaud/runs doesn't exist yet
+	}
+	return undefined;
+}
+
 function workerPrompt(task: string, agent: string, workerId: string, plan?: WorkerPlan): string {
 	const role = plan?.role ?? "gaud-implementer";
 	const assignment = plan
@@ -777,6 +899,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	const id = makeRunId();
 	const repoRoot = ctx.cwd;
 	const runDir = path.join(repoRoot, ".gaud", "runs", id);
+	pollerLogPath = path.join(runDir, "poller.log");
 	const eventsPath = path.join(runDir, "events.jsonl");
 	const statePath = path.join(runDir, "state.json");
 	const tmuxSocket = id;
@@ -784,6 +907,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	await mkdir(runDir, { recursive: true });
 	await mkdir(path.join(runDir, "prompts"), { recursive: true });
 	await writeFile(eventsPath, "", "utf8");
+	await writeFile(pollerLogPath, "", "utf8");
 	const callbackBin = await createCallbackHelper(runDir);
 	const planOverview = await loadPlanOverview(task);
 
@@ -839,10 +963,15 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 		const command = agentCommand(agent, commandName, promptPath, fake);
 		const workerRole = plan?.role ?? "Implementer";
 		const envPrefix = workerEnvPrefix({ id: workerId, agent, role: workerRole, workstream: workerId });
-		const paneResult = await tmux(run, ["split-window", "-d", "-t", tmuxSession, "-P", "-F", "#{pane_id}", `${envPrefix} exec ${command}`]);
+		const paneResult = await tmux(run, ["split-window", "-d", "-t", tmuxSession, "-P", "-F", "#{pane_id}", "bash"]);
 		const paneId = paneResult.stdout.trim();
 		await tmux(run, ["select-layout", "-t", tmuxSession, "tiled"]);
-		if (paneId) await tmux(run, ["pipe-pane", "-o", "-t", paneId, `cat >> ${shellQuote(logPath)}`]);
+		if (paneId) {
+			const pipeResult = await tmux(run, ["pipe-pane", "-o", "-t", paneId, `cat >> ${shellQuote(logPath)}`]);
+			if (pipeResult.code !== 0) recordGaudTrace("launch", "worker pane logging failed", [`worker: ${workerId}`, `error: ${pipeResult.stderr.trim() || "tmux pipe-pane failed"}`]);
+			const sendResult = await tmux(run, ["send-keys", "-t", paneId, `${envPrefix} exec ${command}`, "Enter"]);
+			if (sendResult.code !== 0) recordGaudTrace("launch", "worker command send failed", [`worker: ${workerId}`, `error: ${sendResult.stderr.trim() || "tmux send-keys failed"}`]);
+		}
 		run.workers[workerId] = {
 			id: workerId,
 			agent,
@@ -879,6 +1008,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 async function persistRun(pi?: ExtensionAPI) {
 	if (!activeRun) return;
 	activeRun.updatedAt = Date.now();
+	await writeAllWorkerStatusFiles(activeRun);
 	await writeJson(activeRun.statePath, activeRun);
 	pi?.appendEntry("gaud-state", { id: activeRun.id, statePath: activeRun.statePath, status: activeRun.status, updatedAt: activeRun.updatedAt });
 }
@@ -888,6 +1018,7 @@ async function pollTmux(run: GaudRunState) {
 	if (result.code !== 0) {
 		run.status = "detached";
 		lastPollError = result.stderr.trim() || "tmux list-panes failed";
+		appendPollerLog(run, "tmux_error", { error: lastPollError });
 		return;
 	}
 	const byPane = new Map(result.stdout.trim().split("\n").filter(Boolean).map((line) => {
@@ -895,15 +1026,22 @@ async function pollTmux(run: GaudRunState) {
 		return [paneId, { paneIndex, pid, dead, currentCommand }] as const;
 	}));
 	for (const worker of Object.values(run.workers)) {
+		const prevStatus = worker.status;
 		const pane = worker.paneId ? byPane.get(worker.paneId) : undefined;
 		if (!pane) {
 			worker.status = worker.status === "done" ? "done" : "dead";
-			continue;
+			if (worker.status === "dead") await writeWorkerExitFile(run, worker, { reason: "pane_missing", previousStatus: prevStatus });
+		} else {
+			worker.paneIndex = pane.paneIndex;
+			worker.pid = pane.pid;
+			if (pane.dead === "1" && worker.status !== "done") {
+				worker.status = "dead";
+				await writeWorkerExitFile(run, worker, { reason: "pane_dead", previousStatus: prevStatus, paneIndex: pane.paneIndex, pid: pane.pid, currentCommand: pane.currentCommand });
+			} else if (worker.status === "starting") worker.status = "working";
 		}
-		worker.paneIndex = pane.paneIndex;
-		worker.pid = pane.pid;
-		if (pane.dead === "1" && worker.status !== "done") worker.status = "dead";
-		else if (worker.status === "starting") worker.status = "working";
+		if (worker.status !== prevStatus) {
+			appendPollerLog(run, "worker_status_change", { workerId: worker.id, agent: worker.agent, from: prevStatus, to: worker.status });
+		}
 	}
 }
 
@@ -994,6 +1132,7 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 	pollInFlight = true;
 	lastPollStartedAt = Date.now();
 	nextPollAt = lastPollStartedAt + POLL_INTERVAL_MS;
+	appendPollerLog(activeRun, "poll_start", { workers: workerStatusCountsForLog(activeRun), lastEventOffset: activeRun.lastEventOffset });
 	refreshUi(ctx);
 	try {
 		await pollTmux(activeRun);
@@ -1037,12 +1176,14 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 		}
 		await persistRun(pi);
 		lastPollCompletedAt = Date.now();
+		appendPollerLog(activeRun, "poll_ok", { durationMs: lastPollCompletedAt - lastPollStartedAt, workers: workerStatusCountsForLog(activeRun), lastEventOffset: activeRun.lastEventOffset });
 		consecutivePollErrors = 0;
 		if (activeRun.status !== "detached") lastPollError = undefined;
 		refreshUi(ctx);
 	} catch (error) {
 		consecutivePollErrors += 1;
 		lastPollError = error instanceof Error ? error.message : String(error);
+		if (activeRun) appendPollerLog(activeRun, "poll_error", { durationMs: Date.now() - lastPollStartedAt, error: lastPollError, consecutivePollErrors });
 		try {
 			if (extensionActive) ctx.ui.notify(`Gaud poll error: ${lastPollError}\n\nNext poll in ${formatEta(nextPollAt)}. Use /gaud-peek or /gaud-attach to inspect workers.`, "error");
 		} catch {
@@ -1062,6 +1203,9 @@ function startPolling(pi: ExtensionAPI, ctx: ExtensionContext) {
 	extensionPi = pi;
 	lastCtx = ctx;
 	nextPollAt = Date.now();
+	if (activeRun) {
+		ensurePollerLogPath(activeRun);
+	}
 	pollTimer = setInterval(() => {
 		if (extensionPi && lastCtx) void pollOnce(extensionPi, lastCtx);
 	}, POLL_INTERVAL_MS);
@@ -1090,6 +1234,7 @@ async function stopRun(pi: ExtensionAPI, ctx: ExtensionContext, killTmux: boolea
 	stopPolling();
 	if (killTmux) await killActiveTmuxRun();
 	activeRun.status = "stopped";
+	pollerLogPath = undefined;
 	await persistRun(pi);
 	refreshUi(ctx);
 	ctx.ui.notify(statusText(), "info");
@@ -1154,7 +1299,7 @@ async function restartWorker(pi: ExtensionAPI, ctx: ExtensionContext, workerId: 
 	const oldPaneId = worker.paneId;
 	const markerPath = path.join(activeRun.runDir, "workers", worker.id, "callback.done");
 	await rm(markerPath, { force: true });
-	const paneResult = await tmux(activeRun, ["split-window", "-d", "-t", activeRun.tmuxSession, "-P", "-F", "#{pane_id}", `${workerEnvPrefix(worker)} exec ${worker.command}`]);
+	const paneResult = await tmux(activeRun, ["split-window", "-d", "-t", activeRun.tmuxSession, "-P", "-F", "#{pane_id}", "bash"]);
 	if (paneResult.code !== 0) {
 		ctx.ui.notify(`Failed to restart ${worker.id}: ${paneResult.stderr.trim() || "tmux split-window failed"}`, "error");
 		return false;
@@ -1167,6 +1312,11 @@ async function restartWorker(pi: ExtensionAPI, ctx: ExtensionContext, workerId: 
 	const pipeResult = await tmux(activeRun, ["pipe-pane", "-o", "-t", newPaneId, `cat >> ${shellQuote(worker.logPath)}`]);
 	if (pipeResult.code !== 0) {
 		ctx.ui.notify(`Restarted ${worker.id}, but failed to re-bind pane logging: ${pipeResult.stderr.trim() || "tmux pipe-pane failed"}`, "error");
+	}
+	const sendResult = await tmux(activeRun, ["send-keys", "-t", newPaneId, `${workerEnvPrefix(worker)} exec ${worker.command}`, "Enter"]);
+	if (sendResult.code !== 0) {
+		ctx.ui.notify(`Restarted ${worker.id}, but failed to send command: ${sendResult.stderr.trim() || "tmux send-keys failed"}`, "error");
+		return false;
 	}
 	await tmux(activeRun, ["select-layout", "-t", activeRun.tmuxSession, "tiled"]);
 	if (oldPaneId && oldPaneId !== newPaneId) await tmux(activeRun, ["kill-pane", "-t", oldPaneId]);
@@ -1914,6 +2064,28 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		extensionActive = true;
 		lastCtx = ctx;
+
+		// Auto-resume any active cwd-local run silently — no user action required.
+		// Prefer a live session entry, but fall back to scanning .gaud/runs if the entry is stale or terminal.
+		try {
+			if (!activeRun) {
+				const entries = ctx.sessionManager.getEntries();
+				const latestEntry = [...entries].reverse().find((entry) => entry.type === "custom" && entry.customType === "gaud-state") as { data?: { statePath?: string } } | undefined;
+				const entryState = latestEntry?.data?.statePath ? await readRunState(latestEntry.data.statePath) : undefined;
+				const state = entryState && isActiveRunStatus(entryState.status) ? entryState : await findLatestActiveRun(ctx.cwd);
+				if (state && isActiveRunStatus(state.status)) {
+					activeRun = state;
+					ensurePollerLogPath(state);
+					appendPollerLog(state, "auto_resume", { source: state === entryState ? "session-entry" : "cwd-scan" });
+					recordGaudTrace("session", "auto-resumed run", [`id: ${state.id}`, `status: ${state.status}`, `source: ${state === entryState ? "session-entry" : "cwd-scan"}`]);
+					await reattachPaneLogs(state);
+					startPolling(pi, ctx);
+				}
+			}
+		} catch (error) {
+			recordGaudTrace("session_start", `failed to auto-resume run: ${error}`);
+		}
+
 		refreshUi(ctx);
 	});
 
@@ -2330,8 +2502,17 @@ export default function gaudExtension(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const entries = ctx.sessionManager.getEntries();
 			const latest = [...entries].reverse().find((entry) => entry.type === "custom" && entry.customType === "gaud-state") as { data?: { statePath?: string } } | undefined;
-			activeRun = latest?.data?.statePath ? await readRunState(latest.data.statePath) : undefined;
-			if (activeRun) startPolling(pi, ctx);
+			let run = latest?.data?.statePath ? await readRunState(latest.data.statePath) : undefined;
+			if (!run) {
+				run = await findLatestActiveRun(ctx.cwd);
+			}
+			activeRun = run;
+			if (activeRun) {
+				ensurePollerLogPath(activeRun);
+				appendPollerLog(activeRun, "manual_resume", { source: latest?.data?.statePath ? "session-entry" : "cwd-scan" });
+				await reattachPaneLogs(activeRun);
+				startPolling(pi, ctx);
+			}
 			refreshUi(ctx);
 			ctx.ui.notify(activeRun ? `Resumed ${statusText()}` : "No persisted Gaud run found.", "info");
 		},
