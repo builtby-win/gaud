@@ -134,6 +134,70 @@ type UiContext = Pick<ExtensionContext, "ui">;
 
 type AskUserOption = { label: string; description?: string };
 
+type GaudTraceEntry = {
+	ts: number;
+	phase: string;
+	summary: string;
+	details: string[];
+};
+
+export type GaudRoutingDecision = {
+	shouldPrompt: boolean;
+	score: number;
+	threshold: number;
+	signals: string[];
+	blockers: string[];
+	explanation: string;
+};
+
+const GAUD_ROUTING_THRESHOLD = 4;
+const MAX_GAUD_TRACE_ENTRIES = 50;
+const gaudTraceEntries: GaudTraceEntry[] = [];
+
+function summarizeForTrace(text: string): string {
+	return text.trim().replace(/\s+/g, " ").slice(0, 180) || "(empty)";
+}
+
+function recordGaudTrace(phase: string, summary: string, details: string[] = []) {
+	gaudTraceEntries.push({ ts: Date.now(), phase, summary, details });
+	while (gaudTraceEntries.length > MAX_GAUD_TRACE_ENTRIES) gaudTraceEntries.shift();
+}
+
+function formatGaudTrace(limit = 20): string {
+	const entries = gaudTraceEntries.slice(-Math.max(1, limit));
+	if (entries.length === 0) return "No Gaud trace entries yet.";
+	return entries.map((entry) => {
+		const time = new Date(entry.ts).toLocaleTimeString();
+		const details = entry.details.length ? `\n${entry.details.map((detail) => `  - ${detail}`).join("\n")}` : "";
+		return `${time} [${entry.phase}] ${entry.summary}${details}`;
+	}).join("\n\n");
+}
+
+function routingTraceDetails(text: string, decision: GaudRoutingDecision): string[] {
+	return [
+		`input: ${summarizeForTrace(text)}`,
+		`score: ${decision.score}/${decision.threshold}`,
+		`signals: ${decision.signals.length ? decision.signals.join(", ") : "none"}`,
+		`blockers: ${decision.blockers.length ? decision.blockers.join(", ") : "none"}`,
+		`decision: ${decision.explanation}`,
+	];
+}
+
+function routingConfirmMessage(decision: GaudRoutingDecision): string {
+	return [
+		"This looks like a multi-part task. Gaud can plan it across parallel agents (design, engineering, implementation, review).",
+		"",
+		"Why this prompt appeared:",
+		`- score: ${decision.score}/${decision.threshold}`,
+		`- signals: ${decision.signals.length ? decision.signals.join(", ") : "none"}`,
+		`- blockers: ${decision.blockers.length ? decision.blockers.join(", ") : "none"}`,
+		"",
+		"If this seems wrong, choose No. Run /gaud-trace to inspect recent routing decisions.",
+		"",
+		"Launch Gaud planning wizard?",
+	].join("\n");
+}
+
 export function renderAskUserDialogLines(params: {
 	question: string;
 	options: AskUserOption[];
@@ -686,12 +750,15 @@ async function loadPlanOverview(task: string): Promise<{ planPath?: string; mile
 }
 
 async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, agents: string[], fake: boolean, reason?: string, workerPlans?: WorkerPlan[]) {
+	recordGaudTrace("launch", "launch requested", [`task: ${summarizeForTrace(task)}`, `agents: ${agents.join(",")}`, `fake: ${fake}`, `workerPlans: ${workerPlans?.length ?? 0}`]);
 	if (!fake && !workerPlans?.length) {
+		recordGaudTrace("launch", "launch blocked", ["reason: real run requires worker plans"]);
 		ctx.ui.notify("Real Gaud runs require an approved execution plan before launching workers. Run /gaud-plan PLAN.md first. Use --fake only for smoke tests.", "error");
 		return;
 	}
 
 	if (!(await commandExists("tmux"))) {
+		recordGaudTrace("launch", "launch blocked", ["reason: tmux missing"]);
 		ctx.ui.notify("Gaud requires tmux on PATH. Install tmux, then rerun /gaud doctor.", "error");
 		return;
 	}
@@ -700,7 +767,9 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	const agentCheck = fake ? { ok: requestedAgents.map((agent) => ({ agent, command: agent })), missing: [] } : await checkAgentCommands(requestedAgents);
 	const resolvedAgents = agentCheck.ok;
 	const missingAgents = agentCheck.missing;
+	recordGaudTrace("launch", "agent commands checked", [`resolved: ${resolvedAgents.map((agent) => `${agent.agent}=${agent.command}`).join(",") || "none"}`, `missing: ${missingAgents.join(",") || "none"}`]);
 	if (missingAgents.length > 0) {
+		recordGaudTrace("launch", "launch blocked", [`reason: missing agents ${missingAgents.join(",")}`]);
 		ctx.ui.notify(`Missing agent CLI(s): ${missingAgents.join(", ")}\n\n${(await doctorLines(agents)).join("\n")}`, "error");
 		return;
 	}
@@ -739,6 +808,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 		reason,
 	};
 	activeRun = run;
+	recordGaudTrace("launch", "run state created", [`id: ${id}`, `runDir: ${runDir}`, `plan: ${planOverview.planPath ?? "(none)"}`, `milestone: ${planOverview.currentMilestone}`]);
 
 	await writeJson(path.join(runDir, "launch.json"), { id, task, agents: resolvedAgents, fake, createdAt: Date.now() });
 	const firstPaneResult = await tmux(run, ["new-session", "-d", "-s", tmuxSession, "-P", "-F", "#{pane_id}", "bash"]);
@@ -786,6 +856,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 			objective: plan?.objective,
 			lastEventAt: Date.now(),
 		};
+		recordGaudTrace("launch", "worker pane created", [`worker: ${workerId}`, `role: ${workerRole}`, `agent: ${agent}`, `pane: ${paneId || "(none)"}`, `prompt: ${promptPath}`]);
 	}
 
 	await tmux(run, ["kill-pane", "-t", firstPaneId]);
@@ -794,6 +865,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	await persistRun(pi);
 	refreshUi(ctx);
 	startPolling(pi, ctx);
+	recordGaudTrace("launch", "run started", [`id: ${id}`, `workers: ${Object.keys(run.workers).join(",")}`, `tmux: ${tmuxAttachCommand(run)}`]);
 	ctx.ui.notify(`Started Gaud run ${id} with agents: ${resolvedAgents.map((agent) => agent.agent).join(", ")}. Opening dashboard.`, "info");
 	try {
 		pi.sendUserMessage(
@@ -1471,11 +1543,21 @@ async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: stri
 }
 
 async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: string) {
-	if (planningInFlight) return;
+	if (planningInFlight) {
+		recordGaudTrace("planning", "planning request ignored", ["reason: planning already in flight"]);
+		return;
+	}
 	planningInFlight = true;
 	try {
 		const parsed = parseArgs(args);
+		recordGaudTrace("planning", "wizard started", [`args: ${summarizeForTrace(args)}`, `agents: ${parsed.agents.join(",")}`, `fake: ${parsed.fake}`]);
 		const { taskArgPath, seededFocus, sourcePath, absoluteSourcePath, missingExplicitPath } = await resolvePlanningSource(ctx.cwd, parsed.task);
+		recordGaudTrace("planning", "source resolved", [
+			`taskArgPath: ${taskArgPath || "(none)"}`,
+			`sourcePath: ${sourcePath}`,
+			`seededFocus: ${seededFocus || "(none)"}`,
+			`missingExplicitPath: ${missingExplicitPath}`,
+		]);
 	let planText = "";
 	let focus: string | undefined = seededFocus;
 	let sourceLabel = sourcePath;
@@ -1500,17 +1582,31 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 		planText = generated.markdown;
 		focus = generated.focus;
 		sourceLabel = seededFocus ? "user request" : "one-line request";
+		recordGaudTrace("planning", "autogenerated plan scaffold", [`focus: ${summarizeForTrace(focus)}`, `sourceLabel: ${sourceLabel}`]);
 	}
 
-	if (!focus) return;
+	if (!focus) {
+		recordGaudTrace("planning", "wizard stopped", ["reason: no focus resolved"]);
+		return;
+	}
 	const approvedFocus = focus;
 	let existingConfig = await loadGaudConfig(ctx.cwd);
 	if (!existingConfig?.promptSources) {
 		existingConfig = { orchestrator: { type: "pi", agent: "pi" }, roles: {}, promptSources: { planning: { type: "builtin" }, design: { type: "builtin" }, eng: { type: "builtin" }, implementer: { type: "builtin" }, codeReview: { type: "builtin" } } };
 	}
 	const roleConfig = await defaultRoleAgentsForRun(ctx, parsed.agents);
-	if (!roleConfig) return;
+	if (!roleConfig) {
+		recordGaudTrace("planning", "wizard stopped", ["reason: no role config"]);
+		return;
+	}
+	recordGaudTrace("planning", "agents selected", [
+		`design: ${roleConfig.roles["gaud-design"]}`,
+		`eng: ${roleConfig.roles["gaud-eng"]}`,
+		`implementers: ${roleConfig.roles["gaud-implementer"]?.join(",")}`,
+		`review: ${roleConfig.roles["gaud-code-review"]}`,
+	]);
 	const promptSources = existingConfig?.promptSources ?? { planning: { type: "builtin" }, design: { type: "builtin" }, eng: { type: "builtin" }, implementer: { type: "builtin" }, codeReview: { type: "builtin" } };
+	recordGaudTrace("planning", "methodology sources", Object.entries(promptSources).map(([role, source]) => `${role}: ${source?.type ?? "builtin"}`));
 	const methodology = await Promise.all([
 		resolvePromptSource(promptSources.planning, "planning"),
 		resolvePromptSource(promptSources.design, "design"),
@@ -1521,14 +1617,17 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 	planText = `${planText}\n\n## Gaud Methodology Context\n\n${methodology.map((text, index) => `### ${["planning", "design", "eng", "implementer", "codeReview"][index]}\n\n${text.slice(0, 6000)}`).join("\n\n")}`;
 	const workerPlans = buildWorkerPlans(planText, approvedFocus, roleConfig.roles);
 	if (workerPlans.length === 0) {
+		recordGaudTrace("planning", "worker assignment failed", ["reason: buildWorkerPlans returned 0"]);
 		ctx.ui.notify("No worker assignments were generated.", "error");
 		return;
 	}
+	recordGaudTrace("planning", "worker assignments generated", workerPlans.map((plan) => `${plan.id}: ${plan.role}/${plan.agent} files=${plan.files.join(",")}`));
 	const planDir = path.join(ctx.cwd, ".gaud", "plans");
 	await mkdir(planDir, { recursive: true });
 	const outPath = path.join(planDir, `${makeRunId()}-plan.md`);
 	const generatedMarkdown = renderPlanMarkdown(approvedFocus, sourceLabel, workerPlans, planText);
 	await writeFile(outPath, generatedMarkdown, "utf8");
+	recordGaudTrace("planning", "plan written", [`path: ${outPath}`, `focus: ${summarizeForTrace(approvedFocus)}`]);
 	await launchRun(pi, ctx, `${approvedFocus}\n\nExecution plan: ${outPath}`, workerPlans.map((plan) => plan.agent), parsed.fake, "Auto-launched from planning wizard.", workerPlans);
 	} finally {
 		planningInFlight = false;
@@ -1746,18 +1845,69 @@ function explicitGaudRequest(text: string): string | undefined {
 	return match?.[1]?.trim();
 }
 
-function looksParallelizable(text: string): boolean {
+export function analyzeGaudRouting(text: string): GaudRoutingDecision {
 	const trimmed = text.trim();
 	const lower = trimmed.toLowerCase();
-	if (!trimmed || trimmed.startsWith("/")) return false;
-	if (/^(what|why|how|can you explain|tell me|show me)\b/.test(lower) && !/\b(build|implement|create|make|fix|refactor)\b/.test(lower)) return false;
+	const signals: string[] = [];
+	const blockers: string[] = [];
+	let score = 0;
+
+	if (!trimmed) {
+		blockers.push("empty input");
+		return { shouldPrompt: false, score, threshold: GAUD_ROUTING_THRESHOLD, signals, blockers, explanation: "skip: empty input" };
+	}
+	if (trimmed.startsWith("/")) {
+		blockers.push("slash command");
+		return { shouldPrompt: false, score, threshold: GAUD_ROUTING_THRESHOLD, signals, blockers, explanation: "skip: slash command" };
+	}
 
 	const action = /\b(implement|build|make|refactor|migrate|rewrite|fix|ship|create|add|update|integrate|scaffold)\b/.test(lower);
-	const productNoun = /\b(app|site|website|dashboard|feature|workflow|integration|api|cli|sdk|tool|system|ui|ux|backend|frontend|database)\b/.test(lower);
+	if (action) signals.push("implementation action");
+	else blockers.push("no implementation action");
+
+	const informational = /^(what|why|how|can you explain|tell me|show me)\b/.test(lower) && !action;
+	if (informational) blockers.push("informational question");
+
+	const bigTask = /\b(build|make|create|scaffold)\b.*\b(app|site|website|dashboard|tool|system|workflow|flow|integration)\b/.test(lower);
+	if (bigTask) {
+		score += 4;
+		signals.push("new product/system sized task (+4)");
+	}
+
+	const productNoun = /\b(app|site|website|dashboard|feature|workflow|flow|integration|api|cli|sdk|tool|system|ui|ux|backend|frontend|database)\b/.test(lower);
 	const breadth = /\b(and|plus|multiple|several|all|frontend|backend|api|database|docs|tests|ui|ux|auth|payments|deploy|polish|end-to-end|full stack|full-stack)\b/.test(lower);
-	const bigTask = /\b(build|make|create|scaffold)\b.*\b(app|site|website|dashboard|tool|system|workflow|integration)\b/.test(lower);
+	if (productNoun && breadth) {
+		score += 2;
+		signals.push("product area plus breadth term (+2)");
+	}
+
 	const multiPart = trimmed.split(/\b(?:and|plus|then|also)\b|[,;]/i).filter((part) => part.trim().length > 8).length >= 2;
-	return action && (bigTask || (productNoun && breadth) || multiPart || trimmed.length > 120);
+	if (multiPart) {
+		score += 1;
+		signals.push("multiple clauses (+1)");
+	}
+
+	const scopeTerms = ["frontend", "backend", "api", "database", "ui", "ux", "auth", "payments", "deploy"].filter((term) => new RegExp(`\\b${term}\\b`).test(lower));
+	if (new Set(scopeTerms).size >= 2) {
+		score += 2;
+		signals.push(`cross-module scope: ${[...new Set(scopeTerms)].join("+")} (+2)`);
+	}
+
+	if (trimmed.length > 120) {
+		score += 1;
+		signals.push("long detailed request (+1, weak signal)");
+	}
+
+	if (action && score < GAUD_ROUTING_THRESHOLD) blockers.push("single-agent sized by score");
+	const shouldPrompt = action && !informational && score >= GAUD_ROUTING_THRESHOLD;
+	return {
+		shouldPrompt,
+		score,
+		threshold: GAUD_ROUTING_THRESHOLD,
+		signals,
+		blockers,
+		explanation: shouldPrompt ? `prompt: score ${score} >= ${GAUD_ROUTING_THRESHOLD}` : `skip: score ${score} < ${GAUD_ROUTING_THRESHOLD}`,
+	};
 }
 
 export default function gaudExtension(pi: ExtensionAPI) {
@@ -1808,6 +1958,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 
 		const explicitTask = explicitGaudRequest(event.text);
 		if (explicitTask !== undefined) {
+			recordGaudTrace("routing", "explicit Gaud request", [`input: ${summarizeForTrace(event.text)}`, `task: ${explicitTask || "(empty)"}`]);
 			if (explicitTask === "status") {
 				refreshUi(ctx);
 				ctx.ui.notify(statusText(), "info");
@@ -1819,14 +1970,19 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			return { action: "handled" as const };
 		}
 
-		if (!activeRun && looksParallelizable(event.text)) {
-			const useGaud = await ctx.ui.confirm(
-				"Gaud — parallel agent orchestration",
-				"This looks like a multi-part task. Gaud can plan it across parallel agents (design, engineering, implementation, review).\n\nLaunch Gaud planning wizard?",
-			);
-			if (useGaud) {
-				await runPlanningWizard(pi, ctx, event.text);
-				return { action: "handled" as const };
+		if (!activeRun) {
+			const routing = analyzeGaudRouting(event.text);
+			recordGaudTrace("routing", routing.shouldPrompt ? "auto prompt shown" : "auto prompt skipped", routingTraceDetails(event.text, routing));
+			if (routing.shouldPrompt) {
+				const useGaud = await ctx.ui.confirm(
+					"Gaud — parallel agent orchestration",
+					routingConfirmMessage(routing),
+				);
+				recordGaudTrace("routing", useGaud ? "user accepted auto prompt" : "user declined auto prompt", routingTraceDetails(event.text, routing));
+				if (useGaud) {
+					await runPlanningWizard(pi, ctx, event.text);
+					return { action: "handled" as const };
+				}
 			}
 		}
 
@@ -2037,6 +2193,19 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			if (activeRun) await pollOnce(pi, ctx);
 			refreshUi(ctx);
 			ctx.ui.notify(statusText(), "info");
+		},
+	});
+
+	pi.registerCommand("gaud-trace", {
+		description: "Show recent Gaud routing and planning instrumentation",
+		handler: async (args, ctx) => {
+			if (args.trim() === "clear") {
+				gaudTraceEntries.length = 0;
+				ctx.ui.notify("Gaud trace cleared.", "info");
+				return;
+			}
+			const limit = Number.parseInt(args.trim(), 10);
+			ctx.ui.notify(formatGaudTrace(Number.isFinite(limit) ? limit : 20), "info");
 		},
 	});
 
