@@ -132,6 +132,71 @@ export type GaudRunState = {
 
 type UiContext = Pick<ExtensionContext, "ui">;
 
+type AskUserOption = { label: string; description?: string };
+
+export function renderAskUserDialogLines(params: {
+	question: string;
+	options: AskUserOption[];
+	optionIndex: number;
+	editMode: boolean;
+	editorLines?: string[];
+	width: number;
+	theme: Pick<Theme, "fg">;
+}): string[] {
+	const width = Math.max(1, params.width);
+	const lines: string[] = [];
+
+	if (width < 4) {
+		lines.push(params.theme.fg("accent", params.question));
+		for (let i = 0; i < params.options.length; i++) {
+			const opt = params.options[i];
+			const marker = i === params.optionIndex ? "▸" : " ";
+			lines.push(`${marker} ${opt.label}`);
+			if (opt.description) lines.push(`  ${opt.description}`);
+		}
+		if (params.editMode && params.editorLines) lines.push(...params.editorLines);
+		return lines.map((line) => truncateToWidth(line, width, ""));
+	}
+
+	const innerW = width - 2;
+	const border = (s: string) => params.theme.fg("border", s);
+	const pad = (s: string) => truncateToWidth(s, innerW, "…", true);
+	const boxed = (s = "") => border("│") + pad(s) + border("│");
+
+	lines.push(border(`╭${"─".repeat(innerW)}╮`));
+	lines.push(boxed(params.theme.fg("accent", ` ${params.question}`)));
+	lines.push(boxed());
+
+	for (let i = 0; i < params.options.length; i++) {
+		const opt = params.options[i];
+		const isLast = i === params.options.length - 1;
+		const selected = i === params.optionIndex;
+		const marker = selected ? params.theme.fg("accent", "▸") : " ";
+		const label = isLast ? params.theme.fg("dim", opt.label) : selected ? params.theme.fg("accent", opt.label) : opt.label;
+		const desc = isLast
+			? params.theme.fg("dim", opt.description ?? "")
+			: selected
+				? params.theme.fg("accent", opt.description ?? "")
+				: params.theme.fg("muted", opt.description ?? "");
+		lines.push(boxed(`${marker} ${label}`));
+		if (opt.description) lines.push(boxed(`   ${desc}`));
+	}
+
+	lines.push(boxed());
+	if (params.editMode) {
+		lines.push(boxed(params.theme.fg("muted", " Your answer:")));
+		for (const line of params.editorLines ?? []) {
+			lines.push(boxed(` ${line}`));
+		}
+		lines.push(boxed(params.theme.fg("dim", " Enter to submit · Esc to go back")));
+	} else {
+		lines.push(boxed(params.theme.fg("dim", " ↑↓/j k navigate · Enter to select · Esc to cancel")));
+	}
+	lines.push(border(`╰${"─".repeat(innerW)}╯`));
+
+	return lines.map((line) => truncateToWidth(line, width, "", true));
+}
+
 type ExecResult = { stdout: string; stderr: string; code: number };
 
 let activeRun: GaudRunState | undefined;
@@ -1885,6 +1950,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 					let optionIndex = 0;
 					let editMode = false;
 					let cachedLines: string[] | undefined;
+					let cachedWidth: number | undefined;
 					const editor = new Editor(tui, {
 						borderColor: (s) => theme.fg("accent", s),
 						selectList: { selectedPrefix: (s) => s, selectedText: (s) => s, description: (s) => s, scrollInfo: (s) => s, noMatch: (s) => s },
@@ -1915,39 +1981,19 @@ export default function gaudExtension(pi: ExtensionAPI) {
 					}
 
 					function render(width: number): string[] {
-						if (cachedLines) return cachedLines;
-						const lines: string[] = [];
-						const add = (s: string) => lines.push(truncateToWidth(s, width));
-						const innerW = Math.max(20, width - 2);
-						const pad = (s: string) => truncateToWidth(s, innerW, "…", true);
-						const border = (s: string) => theme.fg("border", s);
-
-						lines.push(border(`╭${"─".repeat(innerW)}╮`));
-						add(border(theme.fg("accent", ` ${params.question}`)));
-						lines.push(border(""));
-						for (let i = 0; i < allOptions.length; i++) {
-							const opt = allOptions[i];
-							const isLast = i === allOptions.length - 1;
-							const selected = i === optionIndex;
-							const marker = selected ? theme.fg("accent", "▸") : " ";
-							const label = isLast ? theme.fg("dim", opt.label) : selected ? theme.fg("accent", opt.label) : opt.label;
-							const desc = isLast ? theme.fg("dim", opt.description) : selected ? theme.fg("accent", opt.description) : theme.fg("muted", opt.description);
-							lines.push(border(`${marker} ${label}`));
-							if (opt.description) lines.push(border(`   ${desc}`));
-						}
-						lines.push(border(""));
-						if (editMode) {
-							lines.push(border(theme.fg("muted", " Your answer:")));
-							for (const line of editor.render(innerW - 2)) {
-								lines.push(border(` ${line}`));
-							}
-							lines.push(border(theme.fg("dim", " Enter to submit · Esc to go back")));
-						} else {
-							lines.push(border(theme.fg("dim", " ↑↓/j k navigate · Enter to select · Esc to cancel")));
-						}
-						lines.push(border(`╰${"─".repeat(innerW)}╯`));
-						cachedLines = lines;
-						return lines;
+						if (cachedLines && cachedWidth === width) return cachedLines;
+						const editorWidth = Math.max(1, width - 4);
+						cachedLines = renderAskUserDialogLines({
+							question: params.question,
+							options: allOptions,
+							optionIndex,
+							editMode,
+							editorLines: editMode ? editor.render(editorWidth) : undefined,
+							width,
+							theme,
+						});
+						cachedWidth = width;
+						return cachedLines;
 					}
 
 					return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
