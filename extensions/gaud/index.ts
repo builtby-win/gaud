@@ -703,6 +703,10 @@ function isActiveRunStatus(status: RunStatus | string | undefined): boolean {
 	return ACTIVE_RUN_STATUSES.includes(status as RunStatus);
 }
 
+function isTerminalRunStatus(status: RunStatus | string | undefined): boolean {
+	return ["stopped", "done", "failed", "detached"].includes(String(status));
+}
+
 function ensurePollerLogPath(run: GaudRunState): string {
 	pollerLogPath = path.join(run.runDir, "poller.log");
 	return pollerLogPath;
@@ -1125,7 +1129,8 @@ async function pollEvents(pi: ExtensionAPI, ctx: ExtensionContext, run: GaudRunS
 async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 	if (!extensionActive) return;
 	if (pollInFlight) return;
-	if (!activeRun || ["stopped", "done", "failed"].includes(activeRun.status)) {
+	if (!activeRun || isTerminalRunStatus(activeRun.status)) {
+		if (activeRun?.status === "detached") stopPolling();
 		refreshUi(ctx);
 		return;
 	}
@@ -1136,6 +1141,13 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 	refreshUi(ctx);
 	try {
 		await pollTmux(activeRun);
+		if (activeRun.status === "detached") {
+			appendPollerLog(activeRun, "poll_detached", { reason: lastPollError ?? "tmux unavailable" });
+			await persistRun(pi);
+			stopPolling();
+			refreshUi(ctx);
+			return;
+		}
 		await pollPanePeeks(activeRun);
 		await pollEvents(pi, ctx, activeRun);
 		const preStuck = new Set(Object.values(activeRun.workers).filter((w) => w.status === "stuck").map((w) => w.id));
@@ -1178,7 +1190,7 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 		lastPollCompletedAt = Date.now();
 		appendPollerLog(activeRun, "poll_ok", { durationMs: lastPollCompletedAt - lastPollStartedAt, workers: workerStatusCountsForLog(activeRun), lastEventOffset: activeRun.lastEventOffset });
 		consecutivePollErrors = 0;
-		if (activeRun.status !== "detached") lastPollError = undefined;
+		lastPollError = undefined;
 		refreshUi(ctx);
 	} catch (error) {
 		consecutivePollErrors += 1;
