@@ -273,7 +273,6 @@ let consecutivePollErrors = 0;
 let lastPollError: string | undefined;
 let dashboardOpen = false;
 let dashboardHandle: { focus?: () => void; setHidden?: (hidden: boolean) => void; hide?: () => void } | undefined;
-let dashboardOffset = { x: 0, y: 0 };
 let planningInFlight = false;
 
 function shellQuote(value: string): string {
@@ -656,6 +655,13 @@ function renderWidget(): string[] {
 	const spinner = pollInFlight ? "⟳" : "○";
 	const lines = [`${spinner} GAUD ${activeRun.id} · ${activeRun.status} · ${pollHealthText()}`];
 	lines.push(`task: ${activeRun.task}`);
+	if (activeRun.milestones?.length) {
+		const progress = activeRun.milestones.map((ms) => {
+			const icon = ms.status === "done" ? "✓" : ms.status === "in-progress" ? "●" : "○";
+			return `${icon} ${ms.id}`;
+		}).join(" ");
+		lines.push(`milestones: ${progress}`);
+	}
 	const stuckOrWaiting: string[] = [];
 	for (const worker of Object.values(activeRun.workers)) {
 		const activity = formatAge(workerLastActivity(worker));
@@ -689,8 +695,11 @@ function refreshUi(ctx?: UiContext) {
 	if (!ctx || !extensionActive) return;
 	try {
 		const isTerminal = activeRun && isTerminalRunStatus(activeRun.status);
+		const milestoneSuffix = activeRun?.milestones?.length
+			? ` · ${activeRun.milestones.filter((ms) => ms.status === "done").length}/${activeRun.milestones.length} ms`
+			: "";
 		const status = activeRun
-			? (isTerminal ? undefined : `gaud: ${activeRun.status} · ${pollInFlight ? "polling" : `next ${formatEta(nextPollAt)}`} · Ctrl+Shift+G dashboard`)
+			? (isTerminal ? undefined : `gaud: ${activeRun.status}${milestoneSuffix} · ${pollInFlight ? "polling" : `next ${formatEta(nextPollAt)}`} · Ctrl+Shift+G dashboard`)
 			: "gaud: idle · Ctrl+Shift+G dashboard";
 		ctx.ui.setStatus("gaud", status);
 		ctx.ui.setWidget("gaud", gaudWidgetForUi(activeRun?.status, dashboardOpen, activeRun ? renderWidget() : []));
@@ -1115,9 +1124,19 @@ async function pollEvents(pi: ExtensionAPI, ctx: ExtensionContext, run: GaudRunS
 			if (["done", "waiting-user", "waiting-permission", "failed"].includes(type)) worker.status = type as WorkerStatus;
 		}
 		if (type === "done" && Object.values(run.workers).every((w) => w.status === "done")) {
-			run.status = "done";
-			if (run.milestones?.[0]) run.milestones[0].status = "done";
-			stopPolling();
+			if (run.milestones?.length) {
+				const current = run.milestones.find((ms) => ms.status === "in-progress");
+				if (current) current.status = "done";
+				const next = run.milestones.find((ms) => ms.status === "planned");
+				if (next) {
+					next.status = "in-progress";
+					run.currentMilestone = next.id;
+				} else if (run.milestones.every((ms) => ms.status === "done")) {
+					run.status = "done";
+				}
+			} else {
+				run.status = "done";
+			}
 		}
 		try {
 			if (["done", "waiting-user", "waiting-permission", "failed"].includes(type)) {
@@ -1958,14 +1977,6 @@ class GaudDashboardComponent implements Component {
 		this.done();
 	}
 
-	private moveDashboard(dx: number, dy: number) {
-		dashboardOffset = { x: dashboardOffset.x + dx, y: dashboardOffset.y + dy };
-	}
-
-	private resetDashboardPosition() {
-		dashboardOffset = { x: 0, y: 0 };
-	}
-
 	private notifyAttach(worker?: WorkerState) {
 		if (!activeRun) return;
 		this.ctx.ui.notify(worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun), "info");
@@ -1974,17 +1985,33 @@ class GaudDashboardComponent implements Component {
 		handleInput(data: string): void {
 		const workers = this.workers();
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) return this.close();
-		if (matchesKey(data, "shift+left") || matchesKey(data, "alt+left") || data === "H") this.moveDashboard(-4, 0);
-		else if (matchesKey(data, "shift+right") || matchesKey(data, "alt+right") || data === "L") this.moveDashboard(4, 0);
-		else if (matchesKey(data, "shift+up") || matchesKey(data, "alt+up") || data === "K") this.moveDashboard(0, -2);
-		else if (matchesKey(data, "shift+down") || matchesKey(data, "alt+down") || data === "J") this.moveDashboard(0, 2);
-		else if (data === "0") this.resetDashboardPosition();
-		else if (matchesKey(data, "down") || matchesKey(data, "j")) this.selected = Math.min(workers.length - 1, this.selected + 1);
+		if (matchesKey(data, "down") || matchesKey(data, "j")) this.selected = Math.min(workers.length - 1, this.selected + 1);
 		else if (matchesKey(data, "up") || matchesKey(data, "k")) this.selected = Math.max(0, this.selected - 1);
 		else if (matchesKey(data, "g")) this.selected = 0;
 		else if (data === "G") this.selected = Math.max(0, workers.length - 1);
 		else if (matchesKey(data, "p") || matchesKey(data, "space")) this.showPane = !this.showPane;
 		else if (matchesKey(data, "r")) void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
+		else if (matchesKey(data, "c")) {
+			void pollOnce(this.pi, this.ctx).then(() => {
+				if (!activeRun) return;
+				const lines = [`Gaud ${activeRun.id} — status check`];
+				if (activeRun.milestones?.length) {
+					const progress = activeRun.milestones.map((ms) => {
+						const icon = ms.status === "done" ? "✓" : ms.status === "in-progress" ? "●" : "○";
+						return `${icon} ${ms.id} ${ms.name} (${ms.status})`;
+					}).join("\n");
+					lines.push(`Milestones:\n${progress}`);
+				}
+				for (const w of Object.values(activeRun.workers)) {
+					const activity = formatAge(workerLastActivity(w));
+					const symbol = workerStatusSymbol(w.status);
+					const detail = w.summary || w.objective || "";
+					lines.push(`${symbol} ${w.id} (${w.agent}/${w.role}) — ${w.status} · last ${activity}${detail ? `\n  ${detail.replace(/\s+/g, " ").slice(0, 120)}` : ""}`);
+				}
+				this.ctx.ui.notify(lines.join("\n"), "info");
+				this.tui.requestRender();
+			});
+		}
 		else if (matchesKey(data, "x")) {
 			const worker = this.selectedWorker();
 			if (worker) void cancelWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
@@ -2016,9 +2043,8 @@ class GaudDashboardComponent implements Component {
 		const line = (value = "") => border("│") + pad(value) + border("│");
 		const lines: string[] = [];
 		lines.push(border(`╭${"─".repeat(innerW)}╮`));
-		lines.push(line(th.fg("accent", "Gaud Dashboard") + `  ${activeRun ? activeRun.id : "no active run"}`));
-		lines.push(line(activeRun ? `${statusText()}` : "No active Gaud run."));
-		lines.push(line("keys: ↑↓/j/k select · H/J/K/L move · 0 reset · Enter/v tmux · p output · s relaunch · x cancel · q/Esc close → back to input"));
+		lines.push(line(th.fg("muted", `${activeRun ? activeRun.id : "no active run"} · ${activeRun ? activeRun.status : ""}`)));
+		lines.push(line(th.fg("muted", "j/k/↑↓ navigate · p pane output · c check status · s relaunch · x cancel · r refresh · q close")));
 		lines.push(line());
 		if (activeRun) {
 			const workers = this.workers();
@@ -2029,12 +2055,14 @@ class GaudDashboardComponent implements Component {
 			lines.push(line(`run: ${activeRun.status} · ${Object.entries(counts).map(([status, count]) => `${status}:${count}`).join(" ")} · poll: ${pollHealthText()}`));
 			if (activeRun.planPath) lines.push(line(`plan: ${activeRun.planPath}`));
 			if (activeRun.milestones?.length) {
-				const milestoneText = activeRun.milestones.map((milestone) => {
-					const icon = milestone.status === "done" ? "✓" : milestone.status === "in-progress" ? "●" : "○";
-					const text = `${icon} ${milestone.id} ${milestone.name}`;
-					return milestone.status === "in-progress" ? th.fg("accent", text) : milestone.status === "done" ? th.fg("success", text) : th.fg("muted", text);
-				}).join("  ");
-				lines.push(line(`milestones: ${milestoneText}`));
+				lines.push(line());
+				lines.push(line(th.fg("accent", "Milestones")));
+				for (const milestone of activeRun.milestones) {
+					const icon = milestone.status === "done" ? th.fg("success", "✓") : milestone.status === "in-progress" ? th.fg("accent", "●") : th.fg("muted", "○");
+					const name = milestone.status === "done" ? th.fg("success", milestone.name) : milestone.status === "in-progress" ? th.fg("accent", milestone.name) : th.fg("muted", milestone.name);
+					lines.push(line(` ${icon} ${milestone.id} — ${name}`));
+				}
+				lines.push(line());
 			}
 			const currentWorkers = workers.filter((worker) => worker.status !== "done").map((worker) => `${worker.role}:${worker.id}`).join(", ");
 			lines.push(line(`current milestone workers: ${currentWorkers || "none active"}`));
@@ -2043,28 +2071,34 @@ class GaudDashboardComponent implements Component {
 				lines.push(line(th.fg("error", `⚠ action needed: ${needsAttention.map((w) => `${w.id}/${w.role}:${w.status}`).join(", ")}`)));
 			}
 			lines.push(line());
-			lines.push(line(th.fg("muted", "   status                role          worker              agent       last activity  summary")));
+			lines.push(line(th.fg("muted", "status · role · worker · agent · last activity")));
 			for (let index = 0; index < workers.length; index++) {
 				const worker = workers[index]!;
 				const marker = index === this.selected ? th.fg("accent", "▸") : " ";
 				const symbol = workerStatusSymbol(worker.status);
-				const status = th.fg(workerStatusColor(worker.status), `${symbol} ${worker.status}`.padEnd(21));
-				const activity = formatAge(workerLastActivity(worker)).padEnd(13);
-				const summary = worker.summary ? ` ${worker.summary}` : "";
-				lines.push(line(`${marker}${status} ${(worker.role || "").padEnd(13)} ${worker.id.padEnd(19)} ${worker.agent.padEnd(10)} ${activity}${summary}`));
+				const status = th.fg(workerStatusColor(worker.status), `${symbol} ${worker.status}`);
+				const activity = formatAge(workerLastActivity(worker));
+				const role = (worker.role || "").padEnd(14);
+				const id = worker.id.padEnd(18);
+				const agent = worker.agent.padEnd(10);
+				lines.push(line(`${marker} ${status.padEnd(12)} ${role} ${id} ${agent} ${activity}`));
+				const subtitle = (worker.summary || worker.objective || "").replace(/\s+/g, " ").trim();
+				if (subtitle) lines.push(line(` ${th.fg("dim", subtitle.slice(0, innerW - 4))}`));
+				if (index < workers.length - 1) lines.push(line(th.fg("dim", "─".repeat(Math.min(innerW, 52)))));
 			}
 			const worker = this.selectedWorker();
 			if (worker) {
-				lines.push(line());
-				lines.push(line(th.fg("accent", `Selected: ${worker.id}`) + `  role=${worker.role} agent=${worker.agent} restarts=${worker.restartCount ?? 0}`));
-				if (worker.objective) lines.push(line(`task: ${worker.objective.replace(/\s+/g, " ").slice(0, innerW - 8)}`));
-				lines.push(line(th.fg(workerStatusColor(worker.status), `${workerStatusSymbol(worker.status)} ${worker.status}`) + (worker.summary ? ` — ${worker.summary}` : "")));
-				if (worker.status === "waiting-permission") lines.push(line(th.fg("warning", "permission: approve in tmux if safe, or press s to relaunch / x to cancel")));
-				if (worker.status === "stuck" || worker.status === "dead") lines.push(line(th.fg("warning", "health: press s to relaunch this worker with the same prompt")));
-				lines.push(line(`tmux: ${tmuxWorkerViewCommand(activeRun, worker)}`));
+				lines.push(line(th.fg("dim", "═".repeat(Math.min(innerW, 60)))));
+				lines.push(line(th.fg("accent", `${workerStatusSymbol(worker.status)} ${worker.id}`) + ` · ${worker.role || ""} · ${worker.agent} · ${worker.status}${worker.restartCount ? ` · ${worker.restartCount} restart${worker.restartCount > 1 ? "s" : ""}` : ""}`));
+				if (worker.objective) lines.push(line(` ${worker.objective.replace(/\s+/g, " ").slice(0, innerW - 4)}`));
+				if (worker.summary) lines.push(line(th.fg("dim", ` ${worker.summary.replace(/\s+/g, " ").slice(0, innerW - 4)}`)));
+				if (worker.status === "waiting-permission") lines.push(line(th.fg("warning", " Needs permission approval or press s to relaunch / x to cancel")));
+				if (worker.status === "stuck" || worker.status === "dead") lines.push(line(th.fg("warning", " No activity for >2m — press s to relaunch or x to cancel")));
+				lines.push(line(` tmux: ${tmuxWorkerViewCommand(activeRun, worker)}`));
 				if (this.showPane) {
-					lines.push(line("latest pane output:"));
-					const paneLines = (worker.lastPeek || "(no pane output captured yet)").split("\n").slice(-14);
+					lines.push(line(th.fg("dim", "─".repeat(Math.min(innerW, 40)))));
+					lines.push(line(" latest pane output:"));
+					const paneLines = (worker.lastPeek || "(no output captured yet)").split("\n").slice(-30);
 					for (const paneLine of paneLines) lines.push(line(`  ${paneLine}`));
 				}
 			}
@@ -2086,13 +2120,13 @@ function showGaudDashboard(pi: ExtensionAPI, ctx: ExtensionContext) {
 	ctx.ui.setWidget("gaud", undefined);
 	refreshUi(ctx);
 	const overlayOptions = (): OverlayOptions => ({
-		anchor: "right-center",
-		width: "60%",
+		anchor: "top-left",
+		width: "100%",
 		minWidth: 56,
-		maxHeight: "75%",
-		margin: 1,
-		offsetX: dashboardOffset.x,
-		offsetY: dashboardOffset.y,
+		maxHeight: "40%",
+		margin: 0,
+		offsetX: 0,
+		offsetY: 0,
 	});
 	void ctx.ui.custom<void>((tui, theme, _keybindings, done) => new GaudDashboardComponent(tui, theme, done, pi, ctx), {
 		overlay: true,
@@ -2208,7 +2242,11 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!activeRun || activeRun.status !== "running") return;
+		if (!activeRun || activeRun.status !== "running") {
+			if (event.systemPrompt.includes("[GAUD")) return;
+			const awareness = `\n\n[GAUD AVAILABLE]\nGaud is a parallel tmux worker system accessible via the gaud_start_run tool. Use it when a task benefits from parallel execution:\n- Multi-file changes spanning 2+ independent modules or workstreams\n- Tasks with clearly parallelizable slices (e.g. frontend + backend, design + implementation, research + build)\n- Work that benefits from frequent check-backs rather than one long unsupervised run\n\nHow to use Gaud:\n1. Read or create a local markdown execution plan with concrete current-milestone tickets.\n2. Derive explicit parallel workers from the plan (agent, role, objective, files, doneCriteria).\n3. Call gaud_start_run with those workers. The extension handles tmux, polling, and callback routing automatically.\n\nDo NOT use Gaud for single-file fixes, trivial changes, typos, or informational questions — handle those directly.`;
+			return { systemPrompt: event.systemPrompt + awareness };
+		}
 		const workers = Object.values(activeRun.workers);
 		const stuck = workers.filter((w) => ["stuck", "waiting-user", "waiting-permission", "dead"].includes(w.status));
 		const done = workers.filter((w) => w.status === "done").length;
