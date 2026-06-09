@@ -193,21 +193,6 @@ function routingTraceDetails(text: string, decision: GaudRoutingDecision): strin
 	];
 }
 
-function routingConfirmMessage(decision: GaudRoutingDecision): string {
-	return [
-		"This looks like a multi-part task. Gaud can plan it across parallel agents (design, engineering, implementation, review).",
-		"",
-		"Why this prompt appeared:",
-		`- score: ${decision.score}/${decision.threshold}`,
-		`- signals: ${decision.signals.length ? decision.signals.join(", ") : "none"}`,
-		`- blockers: ${decision.blockers.length ? decision.blockers.join(", ") : "none"}`,
-		"",
-		"If this seems wrong, choose No. Run /gaud-trace to inspect recent routing decisions.",
-		"",
-		"Launch Gaud planning wizard?",
-	].join("\n");
-}
-
 export function renderAskUserDialogLines(params: {
 	question: string;
 	options: AskUserOption[];
@@ -409,7 +394,7 @@ function makeRunId(): string {
 	return `gaud-${stamp}`;
 }
 
-function parseArgs(args: string): { task: string; agents: string[]; fake: boolean } {
+function parseArgs(args: string): { task: string; agents: string[]; agentsExplicit: boolean; fake: boolean } {
 	const tokens = args.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((token) => token.replace(/^"|"$/g, "")) ?? [];
 	let agents: string[] | undefined;
 	let fake = false;
@@ -430,7 +415,7 @@ function parseArgs(args: string): { task: string; agents: string[]; fake: boolea
 		}
 		taskTokens.push(token);
 	}
-	return { task: taskTokens.join(" ").trim(), agents: agents?.length ? agents : [...DEFAULT_AGENTS], fake };
+	return { task: taskTokens.join(" ").trim(), agents: agents?.length ? agents : [...DEFAULT_AGENTS], agentsExplicit: Boolean(agents?.length), fake };
 }
 
 type MarkdownPlanCandidate = {
@@ -537,6 +522,20 @@ function inferPlanFocus(planText: string, sourcePath: string): string {
 	return base.startsWith("M1") ? base : `M1 — ${base}`;
 }
 
+export function buildGaudDelegationPrompt(task: string): string {
+	const requested = task.trim() || "Use the current repo plan or ask for the intended Gaud task.";
+	return `Gaud requested: ${requested}
+
+You are the foreground Gaud orchestrator. Do not let the extension invent template workers.
+
+Plan first, then launch only the parallel work the plan justifies:
+1. Read the relevant local plan if a path was provided, otherwise inspect/create a local markdown execution plan with PRD, Program DONE Criteria, exactly one current milestone, Milestone DONE Criteria, and current-milestone tickets.
+2. Decide which current-milestone tickets/workstreams are independently parallelizable now. Combine sequential/dependent work into one worker; omit roles that do not have concrete current work.
+3. Choose as many workers as the plan requires and no arbitrary extras. Worker count comes from the plan, not from configured agents or fixed TPM/UX/review templates.
+4. Call gaud_start_run with explicit workers (agent, role, objective, files, doneCriteria). Do not call gaud_start_run without workers for a real run.
+5. If the plan is too vague to derive parallel workstreams, tighten the plan yourself or use ask_user for the specific decision that changes the worker plan.`;
+}
+
 export function agentCommand(agent: string, commandName: string, promptPath: string, fake: boolean): string {
 	if (fake) {
 		return `bash -lc ${shellQuote(`echo "[gaud] fake ${agent} worker started"; sleep 2; echo "[gaud] fake ${agent} worker done"; "$GAUD_CALLBACK_BIN" done --summary "fake ${agent} completed"; exec bash`)}`;
@@ -549,7 +548,7 @@ export function agentCommand(agent: string, commandName: string, promptPath: str
 	const cmd = shellQuote(commandName);
 	const callbackMarker = `"$GAUD_RUN_DIR/workers/$GAUD_WORKER_ID/callback.done"`;
 	const autoCallback = `(status=$?; if [ ! -e ${callbackMarker} ]; then if [ "$status" -eq 0 ]; then "$GAUD_CALLBACK_BIN" done --summary "${agent} completed without explicit callback"; else "$GAUD_CALLBACK_BIN" failed --summary "${agent} exited with status $status"; fi; fi; exec bash)`;
-	const wrap = (invocation: string) => `bash -lc ${shellQuote(`${invocation}; ${autoCallback}`)}`;
+	const wrap = (invocation: string) => `bash -lc ${shellQuote(`B2V_DISABLED=true ${invocation}; ${autoCallback}`)}`;
 
 	if (agent === "claude") return wrap(`${cmd} --dangerously-skip-permissions --print ${promptSubstitution}`);
 	if (agent === "codex") return wrap(`${cmd} --yolo ${promptSubstitution}`);
@@ -999,10 +998,11 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 	refreshUi(ctx);
 	startPolling(pi, ctx);
 	recordGaudTrace("launch", "run started", [`id: ${id}`, `workers: ${Object.keys(run.workers).join(",")}`, `tmux: ${tmuxAttachCommand(run)}`]);
-	ctx.ui.notify(`Started Gaud run ${id} with agents: ${resolvedAgents.map((agent) => agent.agent).join(", ")}. Opening dashboard.`, "info");
+	const launchWorkers = Object.values(run.workers).map((worker) => `${worker.role}/${worker.agent}`).join(", ");
+	ctx.ui.notify(`Started Gaud run ${id} with ${Object.keys(run.workers).length} worker${Object.keys(run.workers).length === 1 ? "" : "s"}: ${launchWorkers}. Opening dashboard.`, "info");
 	try {
 		pi.sendUserMessage(
-			`Gaud run ${id} started. Workers: ${resolvedAgents.map((a) => `${a.agent}`).join(", ")}. Tmux socket: ${tmuxSocket}.\n\nIMPORTANT: The Pi extension owns all polling and GAUDMODE callback forwarding for this run. Do NOT invoke gaud-poll, gaud-tmux-layout, or any other gaud-mode skill infrastructure commands — they conflict with the extension's built-in poller. Worker callbacks will arrive automatically as GAUDMODE follow-up messages. Wait for them before taking action.`,
+			`Gaud run ${id} started. Workers (${Object.keys(run.workers).length}): ${launchWorkers}. Tmux socket: ${tmuxSocket}.\n\nIMPORTANT: The Pi extension owns all polling and GAUDMODE callback forwarding for this run. Do NOT invoke gaud-poll, gaud-tmux-layout, or any other gaud-mode skill infrastructure commands — they conflict with the extension's built-in poller. Worker callbacks will arrive automatically as GAUDMODE follow-up messages. Wait for them before taking action.`,
 			{ deliverAs: "followUp" },
 		);
 	} catch { /* stale ctx at launch */ }
@@ -1353,64 +1353,125 @@ function slugify(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "workstream";
 }
 
-export function buildWorkerPlans(planText: string, focus: string, roleAgents: GaudConfig["roles"]): WorkerPlan[] {
-	const templates: Array<Omit<WorkerPlan, "agent">> = [
-		{
-			id: "tpm",
-			role: "TPM",
-			objective: "Turn the approved outcome into one current milestone with small tickets, dependencies, verification, and check-back triggers. Do not implement.",
-			files: ["PLAN.md", ".gaud/plans/*", "README.md"],
-			doneCriteria: ["Program and milestone DONE criteria are explicit or a concrete blocker is reported.", "Tickets are small, non-overlapping, and scoped to the current milestone.", "Verification commands and check-back triggers are named."],
-		},
-		{
-			id: "investigator",
-			role: "Investigator",
-			objective: "Gather repo facts, edge cases, risks, and implementation constraints for the current milestone. Do not implement unless explicitly assigned cleanup.",
-			files: ["PLAN.md", "README.md", "extensions/gaud/index.ts", "test/*", "scripts/*"],
-			doneCriteria: ["Relevant files and conventions are identified.", "Risks or blockers are concrete and milestone-scoped.", "One recommended default is provided for non-blocking ambiguity."],
-		},
-		{
-			id: "ux-ui",
-			role: "UX/UI",
-			objective: "Review the current milestone for product shape, user journey, copy, layout, and acceptance criteria. Mark non-user-facing work as not applicable quickly.",
-			files: ["PLAN.md", "README.md", "extensions/gaud/index.ts"],
-			doneCriteria: ["UX/product risks are called out or marked not applicable.", "Acceptance criteria are concrete enough for implementers.", "Any proposed scope change is explicit."],
-		},
-		{
-			id: "implementer",
-			role: "Implementer",
-			objective: "Implement one scoped current-milestone ticket only after reading the execution plan. Keep changes small and verify locally.",
-			files: ["extensions/gaud/index.ts", "README.md", "PLAN.md", "test/*"],
-			doneCriteria: ["Scoped code/docs changes are complete.", "Relevant checks pass if code changed.", "Callback summary lists changed files and verification."],
-		},
-		{
-			id: "integrator",
-			role: "Integrator",
-			objective: "Integrate current milestone outputs, review correctness/safety/tests, resolve small glue issues, and report whether the milestone is ready for dogfooding or PM review.",
-			files: ["extensions/gaud/index.ts", "README.md", "PLAN.md", "scripts/*", "test/*"],
-			doneCriteria: ["Review findings are concrete and severity-ranked.", "Critical issues are fixed or reported as blockers.", "Milestone readiness and verification evidence are summarized."],
-		},
-	];
-	const assignments: Array<{ role: GaudRole; agent: string }> = [];
-	if (roleAgents["gaud-eng"]) assignments.push({ role: "TPM", agent: roleAgents["gaud-eng"] });
-	if (roleAgents["gaud-eng"]) assignments.push({ role: "Investigator", agent: roleAgents["gaud-eng"] });
-	if (roleAgents["gaud-design"]) assignments.push({ role: "UX/UI", agent: roleAgents["gaud-design"] });
-	for (const agent of roleAgents["gaud-implementer"] ?? []) assignments.push({ role: "Implementer", agent });
-	if (roleAgents["gaud-code-review"]) assignments.push({ role: "Integrator", agent: roleAgents["gaud-code-review"] });
+type PlanTicket = {
+	title: string;
+	owner?: string;
+	deliverable?: string;
+	verification?: string;
+	files: string[];
+	dependsOn?: string;
+	parallel?: string;
+};
 
-	return assignments.map(({ role, agent }, index) => {
-		const template = templates.find((item) => item.role === role) ?? templates[index % templates.length];
+function fieldValue(block: string, field: string): string | undefined {
+	const match = new RegExp(`^\\s*-\\s*${field}:\\s*(.+)$`, "im").exec(block);
+	return match?.[1]?.trim();
+}
+
+function splitListField(value: string | undefined): string[] {
+	if (!value) return [];
+	return value.split(/[,;]/).map((item) => item.trim()).filter(Boolean);
+}
+
+function currentMilestoneText(planText: string): string {
+	const match = /^##\s+Milestone\s+\d+[^\n]*$/im.exec(planText);
+	if (!match) return planText;
+	const rest = planText.slice((match.index ?? 0) + match[0].length);
+	const next = /^##\s+(?:Milestone\s+\d+|Future Milestones|Dogfooding Gate|PM Decisions|Notes)\b/im.exec(rest);
+	return rest.slice(0, next?.index ?? rest.length);
+}
+
+function extractCurrentMilestoneTickets(planText: string): PlanTicket[] {
+	const milestone = currentMilestoneText(planText);
+	const ticketHeading = /^#{3,5}\s+Ticket\s+\d*:?\s*(.+)$/gim;
+	const matches = [...milestone.matchAll(ticketHeading)];
+	return matches.map((match, index) => {
+		const blockStart = (match.index ?? 0) + match[0].length;
+		const blockEnd = matches[index + 1]?.index ?? milestone.length;
+		const block = milestone.slice(blockStart, blockEnd);
+		const title = match[1]?.trim() || `Ticket ${index + 1}`;
 		return {
-			...template,
-			id: `${slugify(template.id)}-${index + 1}`,
-			agent,
-			objective: `${template.objective}\n\nFocus requested by user: ${focus}`,
+			title,
+			owner: fieldValue(block, "Owner"),
+			deliverable: fieldValue(block, "Deliverable"),
+			verification: fieldValue(block, "Verification"),
+			files: splitListField(fieldValue(block, "Files") ?? fieldValue(block, "Files/areas")),
+			dependsOn: fieldValue(block, "Depends on") ?? fieldValue(block, "Depends"),
+			parallel: fieldValue(block, "Parallel") ?? fieldValue(block, "Parallelizable"),
 		};
 	});
 }
 
+function ticketIsReadyForParallelLaunch(ticket: PlanTicket): boolean {
+	const parallel = ticket.parallel?.toLowerCase();
+	if (parallel && /^(no|false|blocked|after|later)/.test(parallel)) return false;
+	const dependsOn = ticket.dependsOn?.trim().toLowerCase();
+	if (!dependsOn || /^(none|n\/a|no|-)$/i.test(dependsOn)) return true;
+	return false;
+}
+
+function roleForTicket(ticket: PlanTicket): GaudRole {
+	const owner = (ticket.owner || "").toLowerCase();
+	const title = ticket.title.toLowerCase();
+	const combined = `${owner} ${title}`;
+	if (/\b(ux|ui|design|designer|visual)\b/.test(combined)) return "UX/UI";
+	if (/\b(investigator|research|explore|discovery|audit|analysis|eng)\b/.test(combined)) return "Investigator";
+	if (/\b(integrator|review|reviewer|qa|verify|dogfood|test)\b/.test(combined)) return "Integrator";
+	if (/\b(tpm|pm|planner|planning)\b/.test(combined)) return "TPM";
+	return "Implementer";
+}
+
+function agentForRole(role: GaudRole, roleAgents: GaudConfig["roles"], implementerIndex: number): string | undefined {
+	if (role === "UX/UI") return roleAgents["gaud-design"] ?? roleAgents["gaud-implementer"]?.[implementerIndex % (roleAgents["gaud-implementer"]?.length || 1)];
+	if (role === "Integrator") return roleAgents["gaud-code-review"] ?? roleAgents["gaud-implementer"]?.[implementerIndex % (roleAgents["gaud-implementer"]?.length || 1)];
+	if (role === "TPM" || role === "Investigator") return roleAgents["gaud-eng"] ?? roleAgents["gaud-implementer"]?.[implementerIndex % (roleAgents["gaud-implementer"]?.length || 1)];
+	return roleAgents["gaud-implementer"]?.[implementerIndex % (roleAgents["gaud-implementer"].length)] ?? roleAgents["gaud-eng"] ?? roleAgents["gaud-code-review"] ?? roleAgents["gaud-design"];
+}
+
+function fallbackImplementerPlan(focus: string, roleAgents: GaudConfig["roles"]): WorkerPlan[] {
+	const agent = roleAgents["gaud-implementer"]?.[0] ?? roleAgents["gaud-eng"] ?? roleAgents["gaud-code-review"] ?? roleAgents["gaud-design"];
+	if (!agent) return [];
+	return [{
+		id: "implementer-1",
+		agent,
+		role: "Implementer",
+		objective: `Implement the smallest current-plan slice. If the plan does not define parallel tickets yet, tighten the local plan first and report the concrete blocker instead of spawning template roles.\n\nFocus requested by user: ${focus}`,
+		files: ["PLAN.md", "README.md", "extensions/gaud/index.ts", "test/*"],
+		doneCriteria: ["Plan-derived scoped work is complete or a concrete missing-plan blocker is reported.", "Relevant checks pass if code changed.", "Callback summary lists changed files and verification."],
+	}];
+}
+
+export function buildWorkerPlans(planText: string, focus: string, roleAgents: GaudConfig["roles"]): WorkerPlan[] {
+	const tickets = extractCurrentMilestoneTickets(planText).filter(ticketIsReadyForParallelLaunch);
+	if (tickets.length === 0) return fallbackImplementerPlan(focus, roleAgents);
+
+	let implementerIndex = 0;
+	const plans: WorkerPlan[] = [];
+	for (const ticket of tickets) {
+		const role = roleForTicket(ticket);
+		const agent = agentForRole(role, roleAgents, implementerIndex);
+		if (!agent) continue;
+		if (role === "Implementer") implementerIndex++;
+		const idBase = role === "UX/UI" ? "ux-ui" : slugify(role);
+		plans.push({
+			id: `${idBase}-${plans.length + 1}`,
+			agent,
+			role,
+			objective: `${ticket.deliverable || `Complete plan ticket: ${ticket.title}`}\n\nPlan ticket: ${ticket.title}\nFocus requested by user: ${focus}`,
+			files: ticket.files.length ? ticket.files : ["PLAN.md", "README.md", "extensions/gaud/index.ts", "test/*"],
+			doneCriteria: [
+				ticket.verification ? `Verification: ${ticket.verification}` : "Ticket verification is completed or a concrete blocker is reported.",
+				"Work stays inside this ticket/current milestone.",
+				"Callback summary lists changed files and verification.",
+			],
+		});
+	}
+	return plans.length ? plans : fallbackImplementerPlan(focus, roleAgents);
+}
+
 function renderPlanMarkdown(task: string, sourcePath: string, workerPlans: WorkerPlan[], basePlan?: string): string {
-	const workerSection = `## Worker Assignments\n\n${workerPlans.map((plan) => `### ${plan.id} (${plan.role} via ${plan.agent})\n\n${plan.objective}\n\nFiles/areas:\n${plan.files.map((file) => `- ${file}`).join("\n")}\n\nDone criteria:\n${plan.doneCriteria.map((item) => `- ${item}`).join("\n")}`).join("\n\n")}`;
+	const roleSummary = workerPlans.map((plan) => `${plan.role}/${plan.agent}`).join(", ") || "none";
+	const workerSection = `## Worker Assignments\n\nWorker count: ${workerPlans.length} (${roleSummary})\n\nWorker count must come from the plan's current-milestone parallel workstreams; configured agents are a pool, not a requirement to launch every role.\n\n${workerPlans.map((plan) => `### ${plan.id} (${plan.role} via ${plan.agent})\n\n${plan.objective}\n\nFiles/areas:\n${plan.files.map((file) => `- ${file}`).join("\n")}\n\nDone criteria:\n${plan.doneCriteria.map((item) => `- ${item}`).join("\n")}`).join("\n\n")}`;
 	if (basePlan?.trim()) {
 		return `${basePlan.trim()}\n\n---\n\n# Gaud Launch Assignment\n\nSource: ${sourcePath}\n\nTask/focus:\n${task}\n\n${workerSection}\n`;
 	}
@@ -1660,7 +1721,7 @@ function firstInstalled(installed: string[], preferred: string[]): string | unde
 	return preferred.find((agent) => installed.includes(agent)) ?? installed[0];
 }
 
-async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: string[]): Promise<GaudConfig | undefined> {
+async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: string[], agentsExplicit = false): Promise<GaudConfig | undefined> {
 	const installed = await detectInstalledAgents();
 	if (installed.length === 0) {
 		ctx.ui.notify("No supported agent CLIs found. Install claude, opencode, codex, gemini, or antigravity/agy, then run /gaud-doctor.", "error");
@@ -1671,7 +1732,7 @@ async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: stri
 	const parsedInstalled = parsedAgents.filter((agent) => installed.includes(agent));
 	const savedImplementers = savedRoles["gaud-implementer"]?.filter((agent) => installed.includes(agent));
 	const fallbackImplementer = firstInstalled(installed, [...DEFAULT_AGENTS]);
-	const implementers = parsedInstalled.length > 0
+	const implementers = agentsExplicit && parsedInstalled.length > 0
 		? parsedInstalled
 		: savedImplementers?.length
 			? savedImplementers
@@ -1700,8 +1761,19 @@ async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: stri
 	};
 	const needsPersistedRoles = !savedRoles["gaud-design"] || !savedRoles["gaud-eng"] || !savedRoles["gaud-implementer"]?.length || !savedRoles["gaud-code-review"];
 	if (needsPersistedRoles) await saveLocalGaudConfig(ctx.cwd, config);
-	ctx.ui.notify(`Gaud selected agents: design=${design}, eng=${eng}, implementer=${implementers.join(",")}, review=${review}. ${needsPersistedRoles ? "Saved defaults." : "Run /gaud setup to change defaults."}`, "info");
+	ctx.ui.notify(`Gaud agent pool: design=${design}, eng=${eng}, implementer=${implementers.join(",")}, review=${review}. Actual worker count is derived from the plan. ${needsPersistedRoles ? "Saved defaults." : "Run /gaud setup to change defaults."}`, "info");
 	return config;
+}
+
+function delegateGaudPlanningToAgent(pi: ExtensionAPI, ctx: UiContext, task: string) {
+	const prompt = buildGaudDelegationPrompt(task);
+	recordGaudTrace("planning", "delegated to foreground agent", [`task: ${summarizeForTrace(task)}`]);
+	try {
+		pi.sendUserMessage(prompt);
+		ctx.ui.notify("Gaud planning handed to the foreground agent. It will read/create the plan and call gaud_start_run with explicit workers.", "info");
+	} catch (error) {
+		ctx.ui.notify(`Failed to hand Gaud planning to the agent: ${error instanceof Error ? error.message : String(error)}`, "error");
+	}
 }
 
 async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: string) {
@@ -1712,7 +1784,7 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 	planningInFlight = true;
 	try {
 		const parsed = parseArgs(args);
-		recordGaudTrace("planning", "wizard started", [`args: ${summarizeForTrace(args)}`, `agents: ${parsed.agents.join(",")}`, `fake: ${parsed.fake}`]);
+		recordGaudTrace("planning", "wizard started", [`args: ${summarizeForTrace(args)}`, `agents: ${parsed.agents.join(",")}`, `agentsExplicit: ${parsed.agentsExplicit}`, `fake: ${parsed.fake}`]);
 		const { taskArgPath, seededFocus, sourcePath, absoluteSourcePath, missingExplicitPath } = await resolvePlanningSource(ctx.cwd, parsed.task);
 		recordGaudTrace("planning", "source resolved", [
 			`taskArgPath: ${taskArgPath || "(none)"}`,
@@ -1756,7 +1828,7 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 	if (!existingConfig?.promptSources) {
 		existingConfig = { orchestrator: { type: "pi", agent: "pi" }, roles: {}, promptSources: { planning: { type: "builtin" }, design: { type: "builtin" }, eng: { type: "builtin" }, implementer: { type: "builtin" }, codeReview: { type: "builtin" } } };
 	}
-	const roleConfig = await defaultRoleAgentsForRun(ctx, parsed.agents);
+	const roleConfig = await defaultRoleAgentsForRun(ctx, parsed.agents, parsed.agentsExplicit);
 	if (!roleConfig) {
 		recordGaudTrace("planning", "wizard stopped", ["reason: no role config"]);
 		return;
@@ -1784,6 +1856,7 @@ async function runPlanningWizard(pi: ExtensionAPI, ctx: ExtensionContext, args: 
 		return;
 	}
 	recordGaudTrace("planning", "worker assignments generated", workerPlans.map((plan) => `${plan.id}: ${plan.role}/${plan.agent} files=${plan.files.join(",")}`));
+	ctx.ui.notify(`Gaud derived ${workerPlans.length} worker${workerPlans.length === 1 ? "" : "s"} from the plan: ${workerPlans.map((plan) => `${plan.role}/${plan.agent}`).join(", ")}.`, "info");
 	const planDir = path.join(ctx.cwd, ".gaud", "plans");
 	await mkdir(planDir, { recursive: true });
 	const outPath = path.join(planDir, `${makeRunId()}-plan.md`);
@@ -1930,8 +2003,8 @@ class GaudDashboardComponent implements Component {
 				}).join("  ");
 				lines.push(line(`milestones: ${milestoneText}`));
 			}
-			const currentAgents = workers.filter((worker) => worker.status !== "done").map((worker) => `${worker.role}:${worker.id}`).join(", ");
-			lines.push(line(`current milestone agents: ${currentAgents || "none active"}`));
+			const currentWorkers = workers.filter((worker) => worker.status !== "done").map((worker) => `${worker.role}:${worker.id}`).join(", ");
+			lines.push(line(`current milestone workers: ${currentWorkers || "none active"}`));
 			const needsAttention = workers.filter((w) => w.status === "stuck" || w.status === "waiting-user" || w.status === "waiting-permission" || w.status === "dead");
 			if (needsAttention.length > 0) {
 				lines.push(line(th.fg("error", `⚠ action needed: ${needsAttention.map((w) => `${w.id}/${w.role}:${w.status}`).join(", ")}`)));
@@ -2150,24 +2223,13 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			}
 			const parsed = parseArgs(explicitTask);
 			if (parsed.fake) await launchRun(pi, ctx, parsed.task, parsed.agents, true, "User explicitly requested fake Gaud smoke run.");
-			else await runPlanningWizard(pi, ctx, explicitTask);
+			else delegateGaudPlanningToAgent(pi, ctx, explicitTask);
 			return { action: "handled" as const };
 		}
 
 		if (!activeRun) {
 			const routing = analyzeGaudRouting(event.text);
-			recordGaudTrace("routing", routing.shouldPrompt ? "auto prompt shown" : "auto prompt skipped", routingTraceDetails(event.text, routing));
-			if (routing.shouldPrompt) {
-				const useGaud = await ctx.ui.confirm(
-					"Gaud — parallel agent orchestration",
-					routingConfirmMessage(routing),
-				);
-				recordGaudTrace("routing", useGaud ? "user accepted auto prompt" : "user declined auto prompt", routingTraceDetails(event.text, routing));
-				if (useGaud) {
-					await runPlanningWizard(pi, ctx, event.text);
-					return { action: "handled" as const };
-				}
-			}
+			recordGaudTrace("routing", "auto prompt skipped; foreground agent decides", routingTraceDetails(event.text, routing));
 		}
 
 		return { action: "continue" as const };
@@ -2194,31 +2256,17 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "gaud_start_run",
 		label: "Start Gaud Run",
-		description: "Launch parallel specialist agents. You determine the specialization, count, and assignments dynamically — no templates.",
-		promptSnippet: "Use Gaud when the task needs multiple specialist perspectives. Research first with explore agents, then implement, then review. Every worker should have a clear specialization.",
+		description: "Launch Gaud workers from an explicit plan-derived worker assignment. The foreground agent decides the count and roles from parallel current-milestone workstreams.",
+		promptSnippet: "Use Gaud only after you have a plan-derived list of parallel workers. The workers array is required for real runs; do not rely on extension templates.",
 		promptGuidelines: [
-			"**You are the orchestrator.** Analyze the task and decide what specialists it needs. Think in two phases:",
-			"",
-			"**Phase 1 — Research (use cheap/fast agents):**",
-			"- Explorer: reads codebase, finds relevant files, maps patterns. Assign to search/discovery work.",
-			"- Librarian: researches external docs, APIs, OSS examples. Assign when unfamiliar libraries are involved.",
-			"- Investigator: gathers repo facts, edge cases, risks, constraints. Assign before any implementation.",
-			"",
-			"**Phase 2 — Implementation (use strong agents):**",
-			"- Implementer: writes code for one scoped ticket. Assign to claude/codex/gemini based on task type.",
-			"- Reviewer: audits changes for correctness, safety, tests. Assign to a different agent than the implementer.",
-			"- Integrator: verifies all pieces work together, runs checks, reports readiness.",
-			"",
-			"**Sizing by task:**",
-			"- Bug fix, single file → handle yourself (no Gaud needed).",
-			"- Feature, 2-5 files → 2 workers: investigator + implementer.",
-			"- Module, 5-15 files → 3-4 workers: investigator + 1-2 implementers + reviewer.",
-			"- System, 15+ files, multiple modules → 4-7 workers: planner + investigator + 2-3 implementers + reviewer + integrator.",
-			"",
-			"**Agent selection:** Prefer claude for architecture/design, codex for implementation, gemini for analysis, opencode for focused edits. Match agent strengths to role.",
-			"",
-			"**Done criteria:** Each worker's doneCriteria must be concrete and verifiable. Examples: 'All tests pass', 'No new lint errors', 'Callback lists changed files', 'Security review complete with no critical findings'.",
-			"",
+			"**You are the orchestrator. Plan first.** Read or create the local markdown execution plan before launching real workers.",
+			"The plan should identify the current milestone, DONE criteria, and current-milestone tickets/workstreams.",
+			"Worker count comes from the plan: one worker per independent parallel workstream that can start now.",
+			"Combine sequential/dependent tickets into one worker. Omit TPM, UX, reviewer, or integrator roles unless the plan gives them concrete current work.",
+			"Use as many workers as the plan requires and no arbitrary extras. Configured agents are a pool, not a launch checklist.",
+			"For tiny or single-file work, handle it yourself instead of launching Gaud.",
+			"Every worker needs a specific objective, primary files/areas, and concrete doneCriteria tied to the plan.",
+			"If the plan is too vague to derive workers, tighten the plan yourself or call ask_user for the decision that changes the worker plan.",
 			"Do NOT invoke the gaud-mode skill. Callbacks arrive as GAUDMODE messages automatically. Stuck workers include tmux commands to investigate.",
 		],
 		parameters: Type.Object({
@@ -2226,12 +2274,12 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			reason: Type.String({ description: "Why this task benefits from Gaud parallelization." }),
 			workers: Type.Optional(Type.Array(Type.Object({
 				agent: Type.String({ description: "Agent CLI to use: claude, codex, gemini, opencode, antigravity, etc." }),
-				role: Type.String({ description: "Worker role label: e.g. Implementer, Reviewer, Investigator, Designer, Architect, Tester." }),
-				objective: Type.String({ description: "What this worker should accomplish. Be specific." }),
-				files: Type.Array(Type.String(), { description: "Primary files or file patterns this worker should focus on." }),
-				doneCriteria: Type.Array(Type.String(), { description: "How to know this worker is done. Concrete, verifiable." }),
-			}), { description: "Worker assignments you determine. Omit to use the planning wizard." })),
-			agents: Type.Optional(Type.Array(Type.String(), { description: "Agent CLI names (shorthand for simple cases)." })),
+				role: Type.String({ description: "Worker role label from the plan workstream, e.g. Implementer, Reviewer, Investigator, Designer, Tester." }),
+				objective: Type.String({ description: "The exact plan ticket/workstream this worker should accomplish." }),
+				files: Type.Array(Type.String(), { description: "Primary files or file patterns this plan workstream should focus on." }),
+				doneCriteria: Type.Array(Type.String(), { description: "Plan-tied done criteria. Concrete, verifiable." }),
+			}), { description: "Required for real runs. Explicit plan-derived worker assignments chosen by the foreground agent." })),
+			agents: Type.Optional(Type.Array(Type.String(), { description: "Deprecated shorthand. For real runs, choose agents per explicit worker instead." })),
 			fake: Type.Optional(Type.Boolean({ description: "Launch fake bash workers for smoke testing." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2253,10 +2301,15 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				await launchRun(pi, ctx, `${params.task}\n\nExecution plan: ${planPath}`, allAgents, params.fake ?? false, params.reason, workerPlans);
 				return { content: [{ type: "text", text: statusText() }], details: { run: activeRun, reason: params.reason, workers: workerPlans.length } };
 			}
-			const agentArg = params.agents?.length ? ` --agents ${params.agents.join(",")}` : "";
-			const fakeArg = params.fake ? " --fake" : "";
-			await runPlanningWizard(pi, ctx, `${agentArg}${fakeArg} ${params.task}`.trim());
-			return { content: [{ type: "text", text: activeRun ? statusText() : "Gaud plan flow completed without launching workers." }], details: { run: activeRun, reason: params.reason } };
+			if (params.fake && params.agents?.length) {
+				await launchRun(pi, ctx, params.task, params.agents, true, params.reason || "Fake Gaud smoke run requested through gaud_start_run.");
+				return { content: [{ type: "text", text: statusText() }], details: { run: activeRun, reason: params.reason, fake: true } };
+			}
+			const guidance = buildGaudDelegationPrompt(params.task);
+			return {
+				content: [{ type: "text", text: `No Gaud workers launched: gaud_start_run requires explicit plan-derived workers for real runs.\n\n${guidance}` }],
+				details: { run: activeRun, reason: params.reason, workersRequired: true },
+			};
 		},
 	});
 
@@ -2357,9 +2410,9 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("gaud-plan", {
-		description: "Read PLAN.md or another plan file, ask planning questions, create workstreams, and optionally launch Gaud",
+		description: "Hand PLAN.md or another plan request to the foreground agent to derive parallel Gaud workers",
 		handler: async (args, ctx) => {
-			await runPlanningWizard(pi, ctx, args);
+			delegateGaudPlanningToAgent(pi, ctx, args.trim() || "PLAN.md");
 		},
 	});
 
@@ -2394,7 +2447,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("gaud", {
-		description: "Create a Gaud execution plan by default. Usage: /gaud [doctor|status|setup|plan] [--fake] [--agents claude,opencode,antigravity] [task or PLAN.md]",
+		description: "Ask the foreground agent to plan a Gaud run and launch explicit plan-derived workers. Usage: /gaud [doctor|status|setup|plan] [--fake] [--agents claude,opencode,antigravity] [task or PLAN.md]",
 		handler: async (args, ctx) => {
 			const parsed = parseArgs(args);
 			if (parsed.task === "doctor") {
@@ -2414,7 +2467,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				await launchRun(pi, ctx, parsed.task, parsed.agents, true, "User ran /gaud fake smoke run.");
 				return;
 			}
-			await runPlanningWizard(pi, ctx, parsed.task === "plan" ? "PLAN.md" : args.trim());
+			delegateGaudPlanningToAgent(pi, ctx, parsed.task === "plan" ? "PLAN.md" : args.trim());
 		},
 	});
 
