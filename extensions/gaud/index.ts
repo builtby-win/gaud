@@ -528,12 +528,15 @@ export function buildGaudDelegationPrompt(task: string): string {
 
 You are the foreground Gaud orchestrator. Do not let the extension invent template workers.
 
-Plan first, then launch only the parallel work the plan justifies:
+Plan first, derive the worker assignment yourself, then ask the Pi extension to approve and launch only the parallel work the plan justifies:
 1. Read the relevant local plan if a path was provided, otherwise inspect/create a local markdown execution plan with PRD, Program DONE Criteria, exactly one current milestone, Milestone DONE Criteria, and current-milestone tickets.
 2. Decide which current-milestone tickets/workstreams are independently parallelizable now. Combine sequential/dependent work into one worker; omit roles that do not have concrete current work.
 3. Choose as many workers as the plan requires and no arbitrary extras. Worker count comes from the plan, not from configured agents or fixed TPM/UX/review templates.
-4. Call gaud_start_run with explicit workers (agent, role, objective, files, doneCriteria). Do not call gaud_start_run without workers for a real run.
-5. If the plan is too vague to derive parallel workstreams, tighten the plan yourself or use ask_user for the specific decision that changes the worker plan.`;
+4. Use the available role catalog as guidance, not as a launch checklist: TPM/planning, Investigator/research, UX/UI/design, Implementer/build, Integrator/review/test. Dispatch one only when the current milestone has concrete work for that role.
+5. Do not ask the user to manually add workers. You compute every worker assignment yourself and pass it to gaud_start_run.
+6. Call gaud_start_run with explicit workers (agent, role, objective, files, doneCriteria). The Pi extension will show the computed assignment to the user and require approval before real workers start. Do not call gaud_start_run without workers for a real run.
+7. Use ask_user only when a missing product/technical decision changes the worker plan; do not use it for routine launch confirmation.
+8. If the plan is too vague to derive parallel workstreams, tighten the plan yourself before asking the user.`;
 }
 
 export function agentCommand(agent: string, commandName: string, promptPath: string, fake: boolean): string {
@@ -670,6 +673,18 @@ function renderWidget(): string[] {
 	return lines;
 }
 
+export function gaudWidgetForUi(status: string | undefined, isDashboardOpen: boolean, widgetLines: string[]): string[] | undefined {
+	if (isDashboardOpen || !status || isTerminalRunStatus(status)) return undefined;
+	return widgetLines;
+}
+
+function clearTerminalActiveRun(): boolean {
+	if (!activeRun || !isTerminalRunStatus(activeRun.status)) return false;
+	activeRun = undefined;
+	pollerLogPath = undefined;
+	return true;
+}
+
 function refreshUi(ctx?: UiContext) {
 	if (!ctx || !extensionActive) return;
 	try {
@@ -678,8 +693,7 @@ function refreshUi(ctx?: UiContext) {
 			? (isTerminal ? undefined : `gaud: ${activeRun.status} · ${pollInFlight ? "polling" : `next ${formatEta(nextPollAt)}`} · Ctrl+Shift+G dashboard`)
 			: "gaud: idle · Ctrl+Shift+G dashboard";
 		ctx.ui.setStatus("gaud", status);
-		const showWidget = activeRun && !isTerminal && !dashboardOpen;
-		ctx.ui.setWidget("gaud", showWidget ? renderWidget() : undefined);
+		ctx.ui.setWidget("gaud", gaudWidgetForUi(activeRun?.status, dashboardOpen, activeRun ? renderWidget() : []));
 	} catch {
 		// Extension contexts become stale during shutdown/reload. Polling is best-effort.
 	}
@@ -1147,6 +1161,7 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 			appendPollerLog(activeRun, "poll_detached", { reason: lastPollError ?? "tmux unavailable" });
 			await persistRun(pi);
 			stopPolling();
+			clearTerminalActiveRun();
 			refreshUi(ctx);
 			return;
 		}
@@ -1191,6 +1206,10 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 		await persistRun(pi);
 		lastPollCompletedAt = Date.now();
 		appendPollerLog(activeRun, "poll_ok", { durationMs: lastPollCompletedAt - lastPollStartedAt, workers: workerStatusCountsForLog(activeRun), lastEventOffset: activeRun.lastEventOffset });
+		if (isTerminalRunStatus(activeRun.status)) {
+			recordGaudTrace("lifecycle", "clearing terminal active run", [`id: ${activeRun.id}`, `status: ${activeRun.status}`]);
+			clearTerminalActiveRun();
+		}
 		consecutivePollErrors = 0;
 		lastPollError = undefined;
 		refreshUi(ctx);
@@ -1250,8 +1269,10 @@ async function stopRun(pi: ExtensionAPI, ctx: ExtensionContext, killTmux: boolea
 	activeRun.status = "stopped";
 	pollerLogPath = undefined;
 	await persistRun(pi);
+	const message = statusText();
+	clearTerminalActiveRun();
 	refreshUi(ctx);
-	ctx.ui.notify(statusText(), "info");
+	ctx.ui.notify(message, "info");
 }
 
 function findWorker(workerId: string): WorkerState | undefined {
@@ -1261,6 +1282,26 @@ function findWorker(workerId: string): WorkerState | undefined {
 async function confirmWorkerAction(ctx: ExtensionContext, title: string, message: string): Promise<boolean> {
 	if (!ctx.hasUI) return true;
 	return ctx.ui.confirm(title, message);
+}
+
+export function formatWorkerApprovalSummary(workerPlans: WorkerPlan[], planPath: string): string {
+	const lines = [`Plan: ${planPath}`, `Workers: ${workerPlans.length}`];
+	for (const plan of workerPlans) {
+		lines.push(`- ${plan.id}: ${plan.role} via ${plan.agent}`);
+		lines.push(`  Objective: ${plan.objective.replace(/\s+/g, " ").slice(0, 180)}`);
+		if (plan.files.length) lines.push(`  Files: ${plan.files.join(", ").slice(0, 180)}`);
+		if (plan.doneCriteria.length) lines.push(`  Done: ${plan.doneCriteria[0]?.replace(/\s+/g, " ").slice(0, 180)}`);
+	}
+	return lines.join("\n");
+}
+
+async function confirmWorkerLaunch(ctx: ExtensionContext, workerPlans: WorkerPlan[], planPath: string): Promise<boolean> {
+	const summary = formatWorkerApprovalSummary(workerPlans, planPath);
+	if (!ctx.hasUI) {
+		ctx.ui.notify(`Gaud workers not launched: user approval is required before real workers start.\n\n${summary}`, "error");
+		return false;
+	}
+	return ctx.ui.confirm("Start Gaud workers?", `${summary}\n\nStart these workers now?`);
 }
 
 async function cancelWorker(pi: ExtensionAPI, ctx: ExtensionContext, workerId: string, confirm = true): Promise<boolean> {
@@ -1504,13 +1545,15 @@ export function createAutogeneratedPlan(idea: string, cwd: string): { markdown: 
 - [ ] Relevant tests/checks are run, or skipped with a concrete reason.
 - [ ] Any remaining ambiguity is recorded with a recommended default.
 
-## Role Map
+## Available Role Catalog
 
-- Orchestrator: Pi agent
-- gaud-design: selected at launch
-- gaud-eng: selected at launch
-- gaud-implementer: selected at launch
-- gaud-code-review: selected at launch
+- Orchestrator: Pi foreground agent plans the milestone, derives concrete workstreams, and calls gaud_start_run with explicit workers.
+- TPM / planning: use only when there is concrete coordination, sequencing, or plan-maintenance work beyond the foreground orchestrator.
+- Investigator / research: use only when a concrete research/discovery workstream can run independently before implementation.
+- UX/UI / design: use only when there is concrete user-facing design, copy, or interaction work.
+- Implementer / build: use for concrete code/docs/config changes.
+- Integrator / review-test: use only when there is concrete integration, QA, verification, or review work that can start independently.
+- Configured agents are a pool. The planner dynamically dispatches only the roles needed for this milestone.
 
 ## Milestone 1: ${milestoneName}
 
@@ -1529,29 +1572,17 @@ export function createAutogeneratedPlan(idea: string, cwd: string): { markdown: 
 
 ### Tickets
 
-## Ticket 1: Discovery and plan tightening
-- Owner: gaud-eng
-- Deliverable: identify impacted files, edge cases, verification command, and any ambiguity that truly blocks execution.
-- Verification: concise architecture/ticket note in callback.
-- Check-back trigger: only ask the user if multiple reasonable defaults would lead to incompatible implementations.
+The foreground orchestrator must replace this note with concrete current-milestone tickets before dispatching workers. Do not launch generic planning, discovery, design, implementation, or review workers just because those roles exist in the catalog.
 
-## Ticket 2: Product/design acceptance pass
-- Owner: gaud-design
-- Deliverable: refine acceptance criteria, copy/user-facing behavior, and milestone risks without broadening scope by default.
-- Verification: concise acceptance/risk note in callback.
-- Check-back trigger: only ask the user for a product decision if the default would be surprising or destructive.
+Suggested ticket shape when concrete work is known:
 
-## Ticket 3: Implementation
-- Owner: gaud-implementer
-- Deliverable: implement the smallest useful slice for the request.
-- Verification: run the relevant checks and report results.
-- Check-back trigger: ask only for missing credentials/permissions or genuinely blocking product ambiguity.
-
-## Ticket 4: Review
-- Owner: gaud-code-review
-- Deliverable: review changes for correctness, safety, tests, and missed acceptance criteria.
-- Verification: severity-ranked findings or explicit pass.
-- Check-back trigger: only block on critical issues that cannot be safely default-fixed.
+#### Ticket N: Concrete workstream title
+- Owner: Implementer | Investigator | UX/UI | Integrator | TPM
+- Deliverable: specific output this worker can complete independently.
+- Files: concrete files/areas, if known.
+- Verification: concrete check or callback evidence.
+- Depends on: none, or the ticket it must wait for.
+- Parallel: yes/no.
 
 ## Dogfooding Gate
 
@@ -1563,7 +1594,7 @@ export function createAutogeneratedPlan(idea: string, cwd: string): { markdown: 
 - Date: ${today}
 - Decision: Initial Gaud plan was auto-generated from the user's request.
 - Why: Gaud should default obvious planning details itself and ask the user only for material clarification.
-- Next action: Review/edit the generated plan if desired, then launch workers.
+- Next action: Foreground orchestrator derives concrete workstreams from the request/repo, then calls gaud_start_run with only the needed workers.
 `;
 	return { markdown, focus };
 }
@@ -2207,6 +2238,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				activeRun.status = "detached";
 			}
 			await persistRun(pi);
+			clearTerminalActiveRun();
 		}
 		extensionActive = false;
 		refreshUi(ctx);
@@ -2266,6 +2298,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			"Worker count comes from the plan: one worker per independent parallel workstream that can start now.",
 			"Combine sequential/dependent tickets into one worker. Omit TPM, UX, reviewer, or integrator roles unless the plan gives them concrete current work.",
 			"Use as many workers as the plan requires and no arbitrary extras. Configured agents are a pool, not a launch checklist.",
+			"Do not make the user manually add or choose worker assignments. Derive the workers yourself, call this tool with them, and let the extension ask for approval before launch.",
 			"For tiny or single-file work, handle it yourself instead of launching Gaud.",
 			"Every worker needs a specific objective, primary files/areas, and concrete doneCriteria tied to the plan.",
 			"If the plan is too vague to derive workers, tighten the plan yourself or call ask_user for the decision that changes the worker plan.",
@@ -2300,8 +2333,13 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				await mkdir(planDir, { recursive: true });
 				const planPath = path.join(planDir, `${makeRunId()}-plan.md`);
 				await writeFile(planPath, basePlan, "utf8");
+				const approved = params.fake ? true : await confirmWorkerLaunch(ctx, workerPlans, planPath);
+				if (!approved) {
+					const summary = formatWorkerApprovalSummary(workerPlans, planPath);
+					return { content: [{ type: "text", text: `Gaud plan saved, but no workers were launched because user approval is required.\n\n${summary}` }], details: { run: activeRun, reason: params.reason, approved: false, workers: workerPlans.length, planPath } };
+				}
 				await launchRun(pi, ctx, `${params.task}\n\nExecution plan: ${planPath}`, allAgents, params.fake ?? false, params.reason, workerPlans);
-				return { content: [{ type: "text", text: statusText() }], details: { run: activeRun, reason: params.reason, workers: workerPlans.length } };
+				return { content: [{ type: "text", text: statusText() }], details: { run: activeRun, reason: params.reason, approved: true, workers: workerPlans.length } };
 			}
 			if (params.fake && params.agents?.length) {
 				await launchRun(pi, ctx, params.task, params.agents, true, params.reason || "Fake Gaud smoke run requested through gaud_start_run.");
