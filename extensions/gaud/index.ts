@@ -649,7 +649,7 @@ function tmuxWorkerViewCommand(run: GaudRunState, worker: WorkerState): string {
 }
 
 function renderWidget(): string[] {
-	if (!activeRun) return [];
+	if (!activeRun || isTerminalRunStatus(activeRun.status)) return [];
 	const spinner = pollInFlight ? "⟳" : "○";
 	const lines = [`${spinner} GAUD ${activeRun.id} · ${activeRun.status} · ${pollHealthText()}`];
 	lines.push(`task: ${activeRun.task}`);
@@ -673,11 +673,13 @@ function renderWidget(): string[] {
 function refreshUi(ctx?: UiContext) {
 	if (!ctx || !extensionActive) return;
 	try {
+		const isTerminal = activeRun && isTerminalRunStatus(activeRun.status);
 		const status = activeRun
-			? `gaud: ${activeRun.status} · ${pollInFlight ? "polling" : `next ${formatEta(nextPollAt)}`} · Ctrl+Shift+G dashboard`
+			? (isTerminal ? undefined : `gaud: ${activeRun.status} · ${pollInFlight ? "polling" : `next ${formatEta(nextPollAt)}`} · Ctrl+Shift+G dashboard`)
 			: "gaud: idle · Ctrl+Shift+G dashboard";
 		ctx.ui.setStatus("gaud", status);
-		ctx.ui.setWidget("gaud", dashboardOpen ? undefined : renderWidget());
+		const showWidget = activeRun && !isTerminal && !dashboardOpen;
+		ctx.ui.setWidget("gaud", showWidget ? renderWidget() : undefined);
 	} catch {
 		// Extension contexts become stale during shutdown/reload. Polling is best-effort.
 	}
