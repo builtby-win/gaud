@@ -11,7 +11,7 @@ pi install git:github.com/builtby-win/gaud
 Or pin to a specific release:
 
 ```bash
-pi install git:github.com/builtby-win/gaud@v0.1.9
+pi install git:github.com/builtby-win/gaud@v0.1.10
 ```
 
 That's it. No global config required. After install, open Pi in any repo and run `/gaud <task>`.
