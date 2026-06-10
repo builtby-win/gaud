@@ -1825,11 +1825,11 @@ async function runSetupWizard(ctx: ExtensionContext) {
 function suggestedModelsForAgent(agent: string): string[] {
 	switch (agent.toLowerCase()) {
 		case "claude":
-			return ["claude-3-5-sonnet", "claude-3-opus", "claude-3-5-haiku"];
+			return ["4.8 opus", "4.6 sonnet", "fable 5"];
 		case "gemini":
 		case "antigravity":
 		case "agy":
-			return ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-2.0-pro-exp"];
+			return ["gemini-3.5-flash", "gemini-3.5-pro"];
 		default:
 			return [];
 	}
