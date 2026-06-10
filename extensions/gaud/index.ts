@@ -516,7 +516,7 @@ export async function resolvePlanningSource(cwd: string, parsedTask: string): Pr
 
 function inferPlanFocus(planText: string, sourcePath: string): string {
 	const title = /^#\s+(.+)$/m.exec(planText)?.[1]?.trim();
-	const milestone = /^##\s+Milestone\s+\d+\s*:?\s*(.+)$/mi.exec(planText)?.[1]?.trim();
+	const milestone = /^#{2,3}\s+Milestone\s+\d+\s*:?\s*(.+)$/mi.exec(planText)?.[1]?.trim();
 	const base = milestone || title || path.basename(sourcePath, path.extname(sourcePath)).replace(/[-_]+/g, " ");
 	return base.startsWith("M1") ? base : `M1 — ${base}`;
 }
@@ -530,12 +530,15 @@ You are the foreground Gaud orchestrator. Do not let the extension invent templa
 Plan first, derive the worker assignment yourself, then ask the Pi extension to approve and launch only the parallel work the plan justifies:
 1. Read the relevant local plan if a path was provided, otherwise inspect/create a local markdown execution plan with PRD, Program DONE Criteria, exactly one current milestone, Milestone DONE Criteria, and current-milestone tickets.
 2. Decide which current-milestone tickets/workstreams are independently parallelizable now. Combine sequential/dependent work into one worker; omit roles that do not have concrete current work.
-3. Choose as many workers as the plan requires and no arbitrary extras. Worker count comes from the plan, not from configured agents or fixed TPM/UX/review templates.
-4. Use the available role catalog as guidance, not as a launch checklist: TPM/planning, Investigator/research, UX/UI/design, Implementer/build, Integrator/review/test. Dispatch one only when the current milestone has concrete work for that role.
-5. Do not ask the user to manually add workers. You compute every worker assignment yourself and pass it to gaud_start_run.
-6. Call gaud_start_run with explicit workers (agent, role, objective, files, doneCriteria). The Pi extension will show the computed assignment to the user and require approval before real workers start. Do not call gaud_start_run without workers for a real run.
-7. Use ask_user only when a missing product/technical decision changes the worker plan; do not use it for routine launch confirmation.
-8. If the plan is too vague to derive parallel workstreams, tighten the plan yourself before asking the user.`;
+3. Ensure parallel workers have strictly distinct, non-overlapping file scopes and objectives. They must try to not interfere with each other so there are as little conflicts as possible. Make sure they do not step on each other's toes or edit the same files/modules concurrently so the work is extremely parallelizable.
+4. Always determine and allocate explicit agents (e.g., claude, gemini, opencode, antigravity) for each parallel worker role to keep their executions isolated and run them concurrently.
+5. Always sequence a separate integration and review worker (e.g., an Integrator role running a distinct agent) at the end of the milestone. This worker must run at the very end after all parallel workers finish, to integrate all their changes, test the combined codebase, and fix any merge conflicts, glue, or interaction issues.
+6. Choose as many workers as the plan requires and no arbitrary extras. Worker count comes from the plan, not from configured agents or fixed templates.
+7. Use the available role catalog as guidance, not as a launch checklist: TPM/planning, Investigator/research, UX/UI/design, Implementer/build, Integrator/review/test. Dispatch one only when the current milestone has concrete work for that role.
+8. Do not ask the user to manually add workers. You compute every worker assignment yourself and pass it to gaud_start_run.
+9. Call gaud_start_run with explicit workers (agent, role, objective, files, doneCriteria). The Pi extension will show the computed assignment to the user and require approval before real workers start. Do not call gaud_start_run without workers for a real run.
+10. Use ask_user only when a missing product/technical decision changes the worker plan; do not use it for routine launch confirmation.
+11. If the plan is too vague to derive parallel workstreams, tighten the plan yourself before asking the user.`;
 }
 
 export function agentCommand(agent: string, commandName: string, promptPath: string, fake: boolean): string {
@@ -646,7 +649,7 @@ function tmuxAttachCommand(run: GaudRunState): string {
 
 function tmuxWorkerViewCommand(run: GaudRunState, worker: WorkerState): string {
 	return worker.paneId
-		? `tmux -L ${run.tmuxSocket} select-pane -t ${worker.paneId} \\; attach -t ${run.tmuxSession}`
+		? `tmux -L ${run.tmuxSocket} attach -t ${worker.paneId}`
 		: tmuxAttachCommand(run);
 }
 
@@ -875,13 +878,41 @@ async function tmux(run: GaudRunState, args: string[]): Promise<ExecResult> {
 	return execFile("tmux", ["-L", run.tmuxSocket, ...args], { cwd: run.repoRoot, timeoutMs: 10_000 });
 }
 
-function extractPlanPath(task: string): string | undefined {
-	const match = /Execution plan:\s*(.+)$/mi.exec(task);
-	return match?.[1]?.trim();
+export function extractPlanPath(task: string): string | undefined {
+	// 1. Try matching space-less paths first (highly likely for status log entries)
+	const regex = /Execution plan:\s*([^\s\n]+)/gi;
+	let lastMatch: string | undefined;
+	let match;
+	while ((match = regex.exec(task)) !== null) {
+		if (match[1]) {
+			const candidate = match[1].trim();
+			if (existsSync(candidate)) {
+				return candidate;
+			}
+			lastMatch = candidate;
+		}
+	}
+	if (lastMatch && existsSync(lastMatch)) {
+		return lastMatch;
+	}
+
+	// 2. Fall back to matching the entire line (supporting spaces in paths if they are at the end of a line)
+	const regexLine = /Execution plan:\s*([^\n]+)/gi;
+	let lastLineMatch: string | undefined;
+	while ((match = regexLine.exec(task)) !== null) {
+		if (match[1]) {
+			const candidate = match[1].trim();
+			if (existsSync(candidate)) {
+				return candidate;
+			}
+			lastLineMatch = candidate;
+		}
+	}
+	return lastLineMatch ?? lastMatch;
 }
 
 function extractMilestones(planText: string): PlanMilestone[] {
-	const matches = [...planText.matchAll(/^##\s+Milestone\s+(\d+)\s*:?\s*(.+)$/gmi)];
+	const matches = [...planText.matchAll(/^#{2,3}\s+Milestone\s+(\d+)\s*:?\s*(.+)$/gmi)];
 	const milestones = matches.map((match, index) => ({
 		id: `M${match[1] ?? index + 1}`,
 		name: (match[2] ?? `Milestone ${index + 1}`).trim(),
@@ -1436,10 +1467,10 @@ function splitListField(value: string | undefined): string[] {
 }
 
 function currentMilestoneText(planText: string): string {
-	const match = /^##\s+Milestone\s+\d+[^\n]*$/im.exec(planText);
+	const match = /^#{2,3}\s+Milestone\s+\d+[^\n]*$/im.exec(planText);
 	if (!match) return planText;
 	const rest = planText.slice((match.index ?? 0) + match[0].length);
-	const next = /^##\s+(?:Milestone\s+\d+|Future Milestones|Dogfooding Gate|PM Decisions|Notes)\b/im.exec(rest);
+	const next = /^#{2,3}\s+(?:Milestone\s+\d+|Future Milestones|Dogfooding Gate|PM Decisions|Notes)\b/im.exec(rest);
 	return rest.slice(0, next?.index ?? rest.length);
 }
 
@@ -1571,7 +1602,7 @@ export function createAutogeneratedPlan(idea: string, cwd: string): { markdown: 
 - Investigator / research: use only when a concrete research/discovery workstream can run independently before implementation.
 - UX/UI / design: use only when there is concrete user-facing design, copy, or interaction work.
 - Implementer / build: use for concrete code/docs/config changes.
-- Integrator / review-test: use only when there is concrete integration, QA, verification, or review work that can start independently.
+- Integrator / review-test: runs at the very end of the milestone after parallel workers finish, to merge/integrate all changes, test, and fix any conflicts, glue, or interaction issues.
 - Configured agents are a pool. The planner dynamically dispatches only the roles needed for this milestone.
 
 ## Milestone 1: ${milestoneName}
@@ -1598,7 +1629,7 @@ Suggested ticket shape when concrete work is known:
 #### Ticket N: Concrete workstream title
 - Owner: Implementer | Investigator | UX/UI | Integrator | TPM
 - Deliverable: specific output this worker can complete independently.
-- Files: concrete files/areas, if known.
+- Files: concrete files/areas, if known. Must be strictly isolated from other parallel tickets to avoid conflicts and keep work highly parallelizable.
 - Verification: concrete check or callback evidence.
 - Depends on: none, or the ticket it must wait for.
 - Parallel: yes/no.
@@ -1944,6 +1975,8 @@ class GaudDashboardComponent implements Component {
 	private selected = 0;
 	private showPane = true;
 	private tick: ReturnType<typeof setInterval> | undefined;
+	private zoomed = false;
+	private zoomScrollOffset = 0;
 
 	constructor(
 		private tui: TUI,
@@ -1984,12 +2017,71 @@ class GaudDashboardComponent implements Component {
 
 		handleInput(data: string): void {
 		const workers = this.workers();
+		if (this.zoomed) {
+			if (matchesKey(data, "escape") || matchesKey(data, "q")) {
+				this.zoomed = false;
+				this.tui.requestRender();
+				return;
+			}
+			if (matchesKey(data, "left") || matchesKey(data, "h")) {
+				this.selected = this.selected === 0 ? workers.length - 1 : this.selected - 1;
+				this.zoomScrollOffset = 0;
+			}
+			else if (matchesKey(data, "right") || matchesKey(data, "l")) {
+				this.selected = this.selected === workers.length - 1 ? 0 : this.selected + 1;
+				this.zoomScrollOffset = 0;
+			}
+			else if (matchesKey(data, "up") || matchesKey(data, "k")) {
+				this.zoomScrollOffset = Math.max(0, this.zoomScrollOffset - 1);
+			}
+			else if (matchesKey(data, "down") || matchesKey(data, "j")) {
+				this.zoomScrollOffset++;
+			}
+			else if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u") || matchesKey(data, "b")) {
+				const maxH = Math.max(10, Math.floor(this.tui.terminal.rows * 0.5));
+				const contentH = maxH - 5;
+				this.zoomScrollOffset = Math.max(0, this.zoomScrollOffset - contentH);
+			}
+			else if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d") || matchesKey(data, "f") || data === " ") {
+				const maxH = Math.max(10, Math.floor(this.tui.terminal.rows * 0.5));
+				const contentH = maxH - 5;
+				this.zoomScrollOffset = this.zoomScrollOffset + contentH;
+			}
+			else if (matchesKey(data, "s")) {
+				const worker = this.selectedWorker();
+				if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
+			}
+			else if (matchesKey(data, "x")) {
+				const worker = this.selectedWorker();
+				if (worker) void cancelWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
+			}
+			else if (matchesKey(data, "r")) {
+				void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
+			}
+			else if (matchesKey(data, "return") || matchesKey(data, "v")) {
+				const worker = this.selectedWorker();
+				const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
+				const ctx = this.ctx;
+				this.close();
+				if (cmd) {
+					ctx.ui.setEditorText(`!${cmd}`);
+					ctx.ui.notify(`Prefilled input with attach command. Press Enter to attach:\n${cmd}`, "info");
+				}
+			}
+			this.tui.requestRender();
+			return;
+		}
+
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) return this.close();
 		if (matchesKey(data, "down") || matchesKey(data, "j")) this.selected = Math.min(workers.length - 1, this.selected + 1);
 		else if (matchesKey(data, "up") || matchesKey(data, "k")) this.selected = Math.max(0, this.selected - 1);
 		else if (matchesKey(data, "g")) this.selected = 0;
 		else if (data === "G") this.selected = Math.max(0, workers.length - 1);
 		else if (matchesKey(data, "p") || matchesKey(data, "space")) this.showPane = !this.showPane;
+		else if (matchesKey(data, "return") || matchesKey(data, "z")) {
+			this.zoomed = true;
+			this.zoomScrollOffset = 0;
+		}
 		else if (matchesKey(data, "r")) void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
 		else if (matchesKey(data, "c")) {
 			void pollOnce(this.pi, this.ctx).then(() => {
@@ -2021,30 +2113,72 @@ class GaudDashboardComponent implements Component {
 			if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
 		}
 		else if (matchesKey(data, "a")) this.notifyAttach();
-		else if (matchesKey(data, "return") || matchesKey(data, "v")) {
+		else if (matchesKey(data, "v") || matchesKey(data, "y")) {
 			const worker = this.selectedWorker();
 			const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
 			const ctx = this.ctx;
 			this.close();
-			if (cmd) ctx.ui.notify(cmd, "info");
-		}
-		else if (matchesKey(data, "y")) {
-			const worker = this.selectedWorker();
-			if (activeRun) this.ctx.ui.notify(worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun), "info");
+			if (cmd) {
+				ctx.ui.setEditorText(`!${cmd}`);
+				ctx.ui.notify(`Prefilled input with attach command. Press Enter to attach:\n${cmd}`, "info");
+			}
 		}
 		this.tui.requestRender();
 	}
 
 	render(width: number): string[] {
 		const th = this.theme;
-		const innerW = Math.max(20, width - 2);
+		const innerW = width;
 		const pad = (value: string) => truncateToWidth(value, innerW, "…", true);
 		const border = (value: string) => th.fg("border", value);
-		const line = (value = "") => border("│") + pad(value) + border("│");
+		const line = (value = "") => pad(value);
 		const lines: string[] = [];
-		lines.push(border(`╭${"─".repeat(innerW)}╮`));
-		lines.push(line(th.fg("muted", `${activeRun ? activeRun.id : "no active run"} · ${activeRun ? activeRun.status : ""}`)));
-		lines.push(line(th.fg("muted", "j/k/↑↓ navigate · p pane output · c check status · s relaunch · x cancel · r refresh · q close")));
+
+		if (this.zoomed) {
+			const worker = this.selectedWorker();
+			if (!worker) {
+				this.zoomed = false;
+			} else {
+				const maxH = Math.max(10, Math.floor(this.tui.terminal.rows * 0.5));
+				const contentH = maxH - 5; // header + metadata + borders
+
+				// Header
+				lines.push(line(th.fg("accent", ` █ GAUD ZOOM PANE · ${worker.id} `) + th.fg("muted", `· role: ${worker.role || "unknown"} · status: ${worker.status} · agent: ${worker.agent}`)));
+				lines.push(line(th.fg("muted", "   left/right prev/next worker · up/down scroll · s relaunch · x cancel · Enter attach · q/Esc back")));
+				lines.push(line());
+
+				const paneOutput = worker.lastPeek || "(no output captured yet)";
+				const paneLines = paneOutput.split("\n");
+				
+				// Adjust zoomScrollOffset to be within bounds
+				const maxScroll = Math.max(0, paneLines.length - contentH);
+				if (this.zoomScrollOffset > maxScroll) this.zoomScrollOffset = maxScroll;
+				if (this.zoomScrollOffset < 0) this.zoomScrollOffset = 0;
+
+				// Get the slice of lines to render
+				const visibleLines = paneLines.slice(this.zoomScrollOffset, this.zoomScrollOffset + contentH);
+				
+				// Render visible lines and pad to contentH
+				for (let i = 0; i < contentH; i++) {
+					const contentLine = visibleLines[i] ?? "";
+					lines.push(line(`   ${contentLine}`));
+				}
+
+				// Scroll indicator at the bottom
+				const scrollIndicator = paneLines.length > contentH
+					? `   scroll: lines ${this.zoomScrollOffset + 1}-${Math.min(paneLines.length, this.zoomScrollOffset + contentH)} of ${paneLines.length}`
+					: `   scroll: all lines visible`;
+				lines.push(line(th.fg("dim", scrollIndicator)));
+
+				// Bottom border
+				lines.push(border("─".repeat(innerW)));
+				return lines;
+			}
+		}
+
+		// Header line: full-width highlighted bar
+		lines.push(line(th.fg("accent", ` █ GAUD DASHBOARD `) + th.fg("muted", `· ${activeRun ? activeRun.id : "no active run"} · status: ${activeRun ? activeRun.status : ""}`)));
+		lines.push(line(th.fg("muted", "   j/k/↑↓ navigate · Enter/v attach · z zoom pane · p pane output · c check status · s relaunch · x cancel · r refresh · q close")));
 		lines.push(line());
 		if (activeRun) {
 			const workers = this.workers();
@@ -2052,26 +2186,26 @@ class GaudDashboardComponent implements Component {
 				acc[worker.status] = (acc[worker.status] ?? 0) + 1;
 				return acc;
 			}, {});
-			lines.push(line(`run: ${activeRun.status} · ${Object.entries(counts).map(([status, count]) => `${status}:${count}`).join(" ")} · poll: ${pollHealthText()}`));
-			if (activeRun.planPath) lines.push(line(`plan: ${activeRun.planPath}`));
+			lines.push(line(` run: ${activeRun.status} · ${Object.entries(counts).map(([status, count]) => `${status}:${count}`).join(" ")} · poll: ${pollHealthText()}`));
+			if (activeRun.planPath) lines.push(line(` plan: ${activeRun.planPath}`));
 			if (activeRun.milestones?.length) {
 				lines.push(line());
-				lines.push(line(th.fg("accent", "Milestones")));
+				lines.push(line(` ${th.fg("accent", "Milestones")}`));
 				for (const milestone of activeRun.milestones) {
 					const icon = milestone.status === "done" ? th.fg("success", "✓") : milestone.status === "in-progress" ? th.fg("accent", "●") : th.fg("muted", "○");
 					const name = milestone.status === "done" ? th.fg("success", milestone.name) : milestone.status === "in-progress" ? th.fg("accent", milestone.name) : th.fg("muted", milestone.name);
-					lines.push(line(` ${icon} ${milestone.id} — ${name}`));
+					lines.push(line(`   ${icon} ${milestone.id} — ${name}`));
 				}
 				lines.push(line());
 			}
 			const currentWorkers = workers.filter((worker) => worker.status !== "done").map((worker) => `${worker.role}:${worker.id}`).join(", ");
-			lines.push(line(`current milestone workers: ${currentWorkers || "none active"}`));
+			lines.push(line(` current milestone workers: ${currentWorkers || "none active"}`));
 			const needsAttention = workers.filter((w) => w.status === "stuck" || w.status === "waiting-user" || w.status === "waiting-permission" || w.status === "dead");
 			if (needsAttention.length > 0) {
-				lines.push(line(th.fg("error", `⚠ action needed: ${needsAttention.map((w) => `${w.id}/${w.role}:${w.status}`).join(", ")}`)));
+				lines.push(line(` ${th.fg("error", `⚠ action needed: ${needsAttention.map((w) => `${w.id}/${w.role}:${w.status}`).join(", ")}`)}`));
 			}
 			lines.push(line());
-			lines.push(line(th.fg("muted", "status · role · worker · agent · last activity")));
+			lines.push(line(` ${th.fg("muted", "status · role · worker · agent · last activity")}`));
 			for (let index = 0; index < workers.length; index++) {
 				const worker = workers[index]!;
 				const marker = index === this.selected ? th.fg("accent", "▸") : " ";
@@ -2081,29 +2215,30 @@ class GaudDashboardComponent implements Component {
 				const role = (worker.role || "").padEnd(14);
 				const id = worker.id.padEnd(18);
 				const agent = worker.agent.padEnd(10);
-				lines.push(line(`${marker} ${status.padEnd(12)} ${role} ${id} ${agent} ${activity}`));
+				lines.push(line(` ${marker} ${status.padEnd(12)} ${role} ${id} ${agent} ${activity}`));
 				const subtitle = (worker.summary || worker.objective || "").replace(/\s+/g, " ").trim();
-				if (subtitle) lines.push(line(` ${th.fg("dim", subtitle.slice(0, innerW - 4))}`));
-				if (index < workers.length - 1) lines.push(line(th.fg("dim", "─".repeat(Math.min(innerW, 52)))));
+				if (subtitle) lines.push(line(`   ${th.fg("dim", subtitle.slice(0, innerW - 4))}`));
+				if (index < workers.length - 1) lines.push(line(`   ${th.fg("dim", "─".repeat(Math.min(innerW - 6, 52)))}`));
 			}
 			const worker = this.selectedWorker();
 			if (worker) {
-				lines.push(line(th.fg("dim", "═".repeat(Math.min(innerW, 60)))));
-				lines.push(line(th.fg("accent", `${workerStatusSymbol(worker.status)} ${worker.id}`) + ` · ${worker.role || ""} · ${worker.agent} · ${worker.status}${worker.restartCount ? ` · ${worker.restartCount} restart${worker.restartCount > 1 ? "s" : ""}` : ""}`));
-				if (worker.objective) lines.push(line(` ${worker.objective.replace(/\s+/g, " ").slice(0, innerW - 4)}`));
-				if (worker.summary) lines.push(line(th.fg("dim", ` ${worker.summary.replace(/\s+/g, " ").slice(0, innerW - 4)}`)));
-				if (worker.status === "waiting-permission") lines.push(line(th.fg("warning", " Needs permission approval or press s to relaunch / x to cancel")));
-				if (worker.status === "stuck" || worker.status === "dead") lines.push(line(th.fg("warning", " No activity for >2m — press s to relaunch or x to cancel")));
-				lines.push(line(` tmux: ${tmuxWorkerViewCommand(activeRun, worker)}`));
+				lines.push(line(` ${th.fg("dim", "═".repeat(Math.min(innerW - 2, 60)))}`));
+				lines.push(line(` ${th.fg("accent", `${workerStatusSymbol(worker.status)} ${worker.id}`) + ` · ${worker.role || ""} · ${worker.agent} · ${worker.status}${worker.restartCount ? ` · ${worker.restartCount} restart${worker.restartCount > 1 ? "s" : ""}` : ""}`}`));
+				if (worker.objective) lines.push(line(`   ${worker.objective.replace(/\s+/g, " ").slice(0, innerW - 6)}`));
+				if (worker.summary) lines.push(line(`   ${th.fg("dim", worker.summary.replace(/\s+/g, " ").slice(0, innerW - 6))}`));
+				if (worker.status === "waiting-permission") lines.push(line(`   ${th.fg("warning", "Needs permission approval or press s to relaunch / x to cancel")}`));
+				if (worker.status === "stuck" || worker.status === "dead") lines.push(line(`   ${th.fg("warning", "No activity for >2m — press s to relaunch or x to cancel")}`));
+				lines.push(line(`   tmux: ${tmuxWorkerViewCommand(activeRun, worker)}`));
 				if (this.showPane) {
-					lines.push(line(th.fg("dim", "─".repeat(Math.min(innerW, 40)))));
-					lines.push(line(" latest pane output:"));
+					lines.push(line(`   ${th.fg("dim", "─".repeat(Math.min(innerW - 6, 40)))}`));
+					lines.push(line("   latest pane output:"));
 					const paneLines = (worker.lastPeek || "(no output captured yet)").split("\n").slice(-30);
-					for (const paneLine of paneLines) lines.push(line(`  ${paneLine}`));
+					for (const paneLine of paneLines) lines.push(line(`    ${paneLine}`));
 				}
 			}
 		}
-		lines.push(border(`╰${"─".repeat(innerW)}╯`));
+		// Bottom border is just a full width horizontal line separating the dashboard from the content below
+		lines.push(border("─".repeat(innerW)));
 		return lines;
 	}
 }
@@ -2123,7 +2258,7 @@ function showGaudDashboard(pi: ExtensionAPI, ctx: ExtensionContext) {
 		anchor: "top-left",
 		width: "100%",
 		minWidth: 56,
-		maxHeight: "40%",
+		maxHeight: "50%",
 		margin: 0,
 		offsetX: 0,
 		offsetY: 0,
@@ -2244,7 +2379,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!activeRun || activeRun.status !== "running") {
 			if (event.systemPrompt.includes("[GAUD")) return;
-			const awareness = `\n\n[GAUD AVAILABLE]\nGaud is a parallel tmux worker system accessible via the gaud_start_run tool. Use it when a task benefits from parallel execution:\n- Multi-file changes spanning 2+ independent modules or workstreams\n- Tasks with clearly parallelizable slices (e.g. frontend + backend, design + implementation, research + build)\n- Work that benefits from frequent check-backs rather than one long unsupervised run\n\nHow to use Gaud:\n1. Read or create a local markdown execution plan with concrete current-milestone tickets.\n2. Derive explicit parallel workers from the plan (agent, role, objective, files, doneCriteria).\n3. Call gaud_start_run with those workers. The extension handles tmux, polling, and callback routing automatically.\n\nDo NOT use Gaud for single-file fixes, trivial changes, typos, or informational questions — handle those directly.`;
+			const awareness = `\n\n[GAUD AVAILABLE]\nGaud is a parallel tmux worker system accessible via the gaud_start_run tool. Use it when a task benefits from parallel execution:\n- Multi-file changes spanning 2+ independent modules or workstreams\n- Tasks with clearly parallelizable slices (e.g. frontend + backend, design + implementation, research + build)\n- Work that benefits from frequent check-backs rather than one long unsupervised run\n\nHow to use Gaud:\n1. Read or create a local markdown execution plan with concrete current-milestone tickets.\n2. Derive explicit parallel workers from the plan. Ensure they are assigned to distinct, determined agents/roles, and have strictly isolated, non-overlapping file scopes and objectives so they do not interfere or step on each other's toes, keeping merge conflicts to an absolute minimum.\n3. Always sequence a separate final integrator/review worker (e.g., an Integrator role) at the end of the milestone to merge all changes, verify, test, and resolve any conflicts or glue/interaction issues once the parallel workers finish.\n4. Call gaud_start_run with those workers. The extension handles tmux, polling, and callback routing automatically.\n\nDo NOT use Gaud for single-file fixes, trivial changes, typos, or informational questions — handle those directly.`;
 			return { systemPrompt: event.systemPrompt + awareness };
 		}
 		const workers = Object.values(activeRun.workers);
@@ -2334,7 +2469,10 @@ export default function gaudExtension(pi: ExtensionAPI) {
 			"**You are the orchestrator. Plan first.** Read or create the local markdown execution plan before launching real workers.",
 			"The plan should identify the current milestone, DONE criteria, and current-milestone tickets/workstreams.",
 			"Worker count comes from the plan: one worker per independent parallel workstream that can start now.",
-			"Combine sequential/dependent tickets into one worker. Omit TPM, UX, reviewer, or integrator roles unless the plan gives them concrete current work.",
+			"Ensure parallel workers have strictly distinct, non-overlapping file scopes and objectives. They must try to not interfere with each other so there are as little conflicts as possible. Make sure they do not step on each other's toes or edit the same files/modules concurrently so the work is extremely parallelizable.",
+			"Always determine and allocate explicit agents (e.g., claude, gemini, opencode, antigravity) for each parallel worker role to keep their executions isolated and run them concurrently.",
+			"Always sequence a separate integration and review worker (e.g., an Integrator role) at the end of the milestone. This worker's job is to run at the very end after all parallel workers finish, to merge/integrate all changes, test, and fix any conflicts, glue, or interaction issues.",
+			"Combine sequential/dependent tickets into one worker. Omit TPM, UX, reviewer, or integrator roles from the initial parallel wave unless the plan gives them concrete current work.",
 			"Use as many workers as the plan requires and no arbitrary extras. Configured agents are a pool, not a launch checklist.",
 			"Do not make the user manually add or choose worker assignments. Derive the workers yourself, call this tool with them, and let the extension ask for approval before launch.",
 			"For tiny or single-file work, handle it yourself instead of launching Gaud.",
@@ -2604,8 +2742,10 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				ctx.ui.notify("No active Gaud run to attach.", "info");
 				return;
 			}
+			const cmd = tmuxAttachCommand(activeRun);
+			ctx.ui.setEditorText(`!${cmd}`);
 			const workerCommands = Object.values(activeRun.workers).map((worker) => `${worker.id}: ${tmuxWorkerViewCommand(activeRun!, worker)}`);
-			ctx.ui.notify([tmuxAttachCommand(activeRun), "", "Worker panes:", ...workerCommands].join("\n"), "info");
+			ctx.ui.notify([`Prefilled input with attach command. Press Enter to attach.`, ``, `Worker panes:`, ...workerCommands].join("\n"), "info");
 		},
 	});
 

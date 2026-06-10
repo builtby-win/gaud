@@ -1,6 +1,6 @@
 {
   "name": "@builtby-win/gaud",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Pi extension for running Gaud tmux milestone orchestration natively inside Pi",
   "repository": {
     "type": "git",
