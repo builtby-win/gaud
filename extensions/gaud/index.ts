@@ -1975,8 +1975,6 @@ class GaudDashboardComponent implements Component {
 	private selected = 0;
 	private showPane = true;
 	private tick: ReturnType<typeof setInterval> | undefined;
-	private zoomed = false;
-	private zoomScrollOffset = 0;
 
 	constructor(
 		private tui: TUI,
@@ -2015,77 +2013,14 @@ class GaudDashboardComponent implements Component {
 		this.ctx.ui.notify(worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun), "info");
 	}
 
-	public isZoomed(): boolean {
-		return this.zoomed;
-	}
-
 	handleInput(data: string): void {
 		const workers = this.workers();
-		if (this.zoomed) {
-			if (matchesKey(data, "escape") || matchesKey(data, "q") || matchesKey(data, "z")) {
-				this.zoomed = false;
-				this.tui.requestRender();
-				return;
-			}
-			if (matchesKey(data, "left") || matchesKey(data, "h")) {
-				this.selected = this.selected === 0 ? workers.length - 1 : this.selected - 1;
-				this.zoomScrollOffset = 0;
-			}
-			else if (matchesKey(data, "right") || matchesKey(data, "l")) {
-				this.selected = this.selected === workers.length - 1 ? 0 : this.selected + 1;
-				this.zoomScrollOffset = 0;
-			}
-			else if (matchesKey(data, "up") || matchesKey(data, "k")) {
-				this.zoomScrollOffset = Math.max(0, this.zoomScrollOffset - 1);
-			}
-			else if (matchesKey(data, "down") || matchesKey(data, "j")) {
-				this.zoomScrollOffset++;
-			}
-			else if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u") || matchesKey(data, "b")) {
-				const maxH = this.tui.terminal.rows;
-				const contentH = Math.max(5, maxH - 5);
-				this.zoomScrollOffset = Math.max(0, this.zoomScrollOffset - contentH);
-			}
-			else if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d") || matchesKey(data, "f") || data === " ") {
-				const maxH = this.tui.terminal.rows;
-				const contentH = Math.max(5, maxH - 5);
-				this.zoomScrollOffset = this.zoomScrollOffset + contentH;
-			}
-			else if (matchesKey(data, "s")) {
-				const worker = this.selectedWorker();
-				if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
-			}
-			else if (matchesKey(data, "x")) {
-				const worker = this.selectedWorker();
-				if (worker) void cancelWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
-			}
-			else if (matchesKey(data, "r")) {
-				void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
-			}
-			else if (matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y")) {
-				const worker = this.selectedWorker();
-				const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
-				const ctx = this.ctx;
-				this.close();
-				if (cmd) {
-					ctx.ui.setEditorText(`!${cmd}`);
-					ctx.ui.notify(`Prefilled input with attach command. Press Enter to attach:\n${cmd}`, "info");
-				}
-			}
-			this.tui.requestRender();
-			return;
-		}
-
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "q")) return this.close();
 		if (matchesKey(data, "down") || matchesKey(data, "j")) this.selected = Math.min(workers.length - 1, this.selected + 1);
 		else if (matchesKey(data, "up") || matchesKey(data, "k")) this.selected = Math.max(0, this.selected - 1);
 		else if (matchesKey(data, "g")) this.selected = 0;
 		else if (data === "G") this.selected = Math.max(0, workers.length - 1);
 		else if (matchesKey(data, "p") || matchesKey(data, "space")) this.showPane = !this.showPane;
-		else if (matchesKey(data, "z")) {
-			this.zoomed = true;
-			this.zoomScrollOffset = 0;
-		}
 		else if (matchesKey(data, "r")) void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
 		else if (matchesKey(data, "c")) {
 			void pollOnce(this.pi, this.ctx).then(() => {
@@ -2117,7 +2052,7 @@ class GaudDashboardComponent implements Component {
 			if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
 		}
 		else if (matchesKey(data, "a")) this.notifyAttach();
-		else if (matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y")) {
+		else if (matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y") || matchesKey(data, "z")) {
 			const worker = this.selectedWorker();
 			const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
 			const ctx = this.ctx;
@@ -2138,51 +2073,9 @@ class GaudDashboardComponent implements Component {
 		const line = (value = "") => pad(value);
 		const lines: string[] = [];
 
-		if (this.zoomed) {
-			const worker = this.selectedWorker();
-			if (!worker) {
-				this.zoomed = false;
-			} else {
-				const maxH = this.tui.terminal.rows;
-				const contentH = Math.max(5, maxH - 5); // header + metadata + borders
-
-				// Header
-				lines.push(line(th.fg("accent", ` █ GAUD ZOOM PANE · ${worker.id} `) + th.fg("muted", `· role: ${worker.role || "unknown"} · status: ${worker.status} · agent: ${worker.agent}`)));
-				lines.push(line(th.fg("muted", "   left/right prev/next worker · up/down scroll · s relaunch · x cancel · Enter attach · q/Esc back")));
-				lines.push(line());
-
-				const paneOutput = worker.lastPeek || "(no output captured yet)";
-				const paneLines = paneOutput.split("\n");
-				
-				// Adjust zoomScrollOffset to be within bounds
-				const maxScroll = Math.max(0, paneLines.length - contentH);
-				if (this.zoomScrollOffset > maxScroll) this.zoomScrollOffset = maxScroll;
-				if (this.zoomScrollOffset < 0) this.zoomScrollOffset = 0;
-
-				// Get the slice of lines to render
-				const visibleLines = paneLines.slice(this.zoomScrollOffset, this.zoomScrollOffset + contentH);
-				
-				// Render visible lines and pad to contentH
-				for (let i = 0; i < contentH; i++) {
-					const contentLine = visibleLines[i] ?? "";
-					lines.push(line(`   ${contentLine}`));
-				}
-
-				// Scroll indicator at the bottom
-				const scrollIndicator = paneLines.length > contentH
-					? `   scroll: lines ${this.zoomScrollOffset + 1}-${Math.min(paneLines.length, this.zoomScrollOffset + contentH)} of ${paneLines.length}`
-					: `   scroll: all lines visible`;
-				lines.push(line(th.fg("dim", scrollIndicator)));
-
-				// Bottom border
-				lines.push(border("─".repeat(innerW)));
-				return lines;
-			}
-		}
-
 		// Header line: full-width highlighted bar
 		lines.push(line(th.fg("accent", ` █ GAUD DASHBOARD `) + th.fg("muted", `· ${activeRun ? activeRun.id : "no active run"} · status: ${activeRun ? activeRun.status : ""}`)));
-		lines.push(line(th.fg("muted", "   j/k/↑↓ navigate · Enter/v attach · z zoom pane · p pane output · c check status · s relaunch · x cancel · r refresh · q close")));
+		lines.push(line(th.fg("muted", "   j/k/↑↓ navigate · Enter/v/z attach · p pane output · c check status · s relaunch · x cancel · r refresh · q close")));
 		lines.push(line());
 		if (activeRun) {
 			const workers = this.workers();
@@ -2258,35 +2151,22 @@ function showGaudDashboard(pi: ExtensionAPI, ctx: ExtensionContext) {
 	dashboardOpen = true;
 	ctx.ui.setWidget("gaud", undefined);
 	refreshUi(ctx);
-
-	let component: GaudDashboardComponent | undefined;
-
-	const overlayOptions = (): OverlayOptions => {
-		const isZoomed = component ? component.isZoomed() : false;
-		return {
-			anchor: "top-left",
-			width: "100%",
-			minWidth: 56,
-			maxHeight: isZoomed ? "100%" : "50%",
-			margin: 0,
-			offsetX: 0,
-			offsetY: 0,
-		};
-	};
-
-	void ctx.ui.custom<void>(
-		(tui, theme, _keybindings, done) => {
-			component = new GaudDashboardComponent(tui, theme, done, pi, ctx);
-			return component;
+	const overlayOptions = (): OverlayOptions => ({
+		anchor: "top-left",
+		width: "100%",
+		minWidth: 56,
+		maxHeight: "50%",
+		margin: 0,
+		offsetX: 0,
+		offsetY: 0,
+	});
+	void ctx.ui.custom<void>((tui, theme, _keybindings, done) => new GaudDashboardComponent(tui, theme, done, pi, ctx), {
+		overlay: true,
+		overlayOptions,
+		onHandle: (handle) => {
+			dashboardHandle = handle;
 		},
-		{
-			overlay: true,
-			overlayOptions,
-			onHandle: (handle) => {
-				dashboardHandle = handle;
-			},
-		}
-	).finally(() => {
+	}).finally(() => {
 		dashboardOpen = false;
 		dashboardHandle = undefined;
 		refreshUi(ctx);
