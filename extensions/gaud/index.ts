@@ -1114,7 +1114,7 @@ function stuckSummary(worker: WorkerState): string {
 async function pollPanePeeks(run: GaudRunState) {
 	for (const worker of Object.values(run.workers)) {
 		if (!worker.paneId) continue;
-		const result = await tmux(run, ["capture-pane", "-p", "-t", worker.paneId, "-S", `-${PEEK_LINES}`]);
+		const result = await tmux(run, ["capture-pane", "-e", "-p", "-t", worker.paneId, "-S", `-${PEEK_LINES}`]);
 		if (result.code === 0) {
 			const peek = result.stdout.trimEnd();
 			if (peek && peek !== worker.lastPeek) {
@@ -2015,10 +2015,14 @@ class GaudDashboardComponent implements Component {
 		this.ctx.ui.notify(worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun), "info");
 	}
 
-		handleInput(data: string): void {
+	public isZoomed(): boolean {
+		return this.zoomed;
+	}
+
+	handleInput(data: string): void {
 		const workers = this.workers();
 		if (this.zoomed) {
-			if (matchesKey(data, "escape") || matchesKey(data, "q")) {
+			if (matchesKey(data, "escape") || matchesKey(data, "q") || matchesKey(data, "z")) {
 				this.zoomed = false;
 				this.tui.requestRender();
 				return;
@@ -2038,13 +2042,13 @@ class GaudDashboardComponent implements Component {
 				this.zoomScrollOffset++;
 			}
 			else if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u") || matchesKey(data, "b")) {
-				const maxH = Math.max(10, Math.floor(this.tui.terminal.rows * 0.5));
-				const contentH = maxH - 5;
+				const maxH = this.tui.terminal.rows;
+				const contentH = Math.max(5, maxH - 5);
 				this.zoomScrollOffset = Math.max(0, this.zoomScrollOffset - contentH);
 			}
 			else if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d") || matchesKey(data, "f") || data === " ") {
-				const maxH = Math.max(10, Math.floor(this.tui.terminal.rows * 0.5));
-				const contentH = maxH - 5;
+				const maxH = this.tui.terminal.rows;
+				const contentH = Math.max(5, maxH - 5);
 				this.zoomScrollOffset = this.zoomScrollOffset + contentH;
 			}
 			else if (matchesKey(data, "s")) {
@@ -2058,7 +2062,7 @@ class GaudDashboardComponent implements Component {
 			else if (matchesKey(data, "r")) {
 				void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
 			}
-			else if (matchesKey(data, "return") || matchesKey(data, "v")) {
+			else if (matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y")) {
 				const worker = this.selectedWorker();
 				const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
 				const ctx = this.ctx;
@@ -2078,7 +2082,7 @@ class GaudDashboardComponent implements Component {
 		else if (matchesKey(data, "g")) this.selected = 0;
 		else if (data === "G") this.selected = Math.max(0, workers.length - 1);
 		else if (matchesKey(data, "p") || matchesKey(data, "space")) this.showPane = !this.showPane;
-		else if (matchesKey(data, "return") || matchesKey(data, "z")) {
+		else if (matchesKey(data, "z")) {
 			this.zoomed = true;
 			this.zoomScrollOffset = 0;
 		}
@@ -2113,7 +2117,7 @@ class GaudDashboardComponent implements Component {
 			if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
 		}
 		else if (matchesKey(data, "a")) this.notifyAttach();
-		else if (matchesKey(data, "v") || matchesKey(data, "y")) {
+		else if (matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y")) {
 			const worker = this.selectedWorker();
 			const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
 			const ctx = this.ctx;
@@ -2139,8 +2143,8 @@ class GaudDashboardComponent implements Component {
 			if (!worker) {
 				this.zoomed = false;
 			} else {
-				const maxH = Math.max(10, Math.floor(this.tui.terminal.rows * 0.5));
-				const contentH = maxH - 5; // header + metadata + borders
+				const maxH = this.tui.terminal.rows;
+				const contentH = Math.max(5, maxH - 5); // header + metadata + borders
 
 				// Header
 				lines.push(line(th.fg("accent", ` █ GAUD ZOOM PANE · ${worker.id} `) + th.fg("muted", `· role: ${worker.role || "unknown"} · status: ${worker.status} · agent: ${worker.agent}`)));
@@ -2254,22 +2258,35 @@ function showGaudDashboard(pi: ExtensionAPI, ctx: ExtensionContext) {
 	dashboardOpen = true;
 	ctx.ui.setWidget("gaud", undefined);
 	refreshUi(ctx);
-	const overlayOptions = (): OverlayOptions => ({
-		anchor: "top-left",
-		width: "100%",
-		minWidth: 56,
-		maxHeight: "50%",
-		margin: 0,
-		offsetX: 0,
-		offsetY: 0,
-	});
-	void ctx.ui.custom<void>((tui, theme, _keybindings, done) => new GaudDashboardComponent(tui, theme, done, pi, ctx), {
-		overlay: true,
-		overlayOptions,
-		onHandle: (handle) => {
-			dashboardHandle = handle;
+
+	let component: GaudDashboardComponent | undefined;
+
+	const overlayOptions = (): OverlayOptions => {
+		const isZoomed = component ? component.isZoomed() : false;
+		return {
+			anchor: "top-left",
+			width: "100%",
+			minWidth: 56,
+			maxHeight: isZoomed ? "100%" : "50%",
+			margin: 0,
+			offsetX: 0,
+			offsetY: 0,
+		};
+	};
+
+	void ctx.ui.custom<void>(
+		(tui, theme, _keybindings, done) => {
+			component = new GaudDashboardComponent(tui, theme, done, pi, ctx);
+			return component;
 		},
-	}).finally(() => {
+		{
+			overlay: true,
+			overlayOptions,
+			onHandle: (handle) => {
+				dashboardHandle = handle;
+			},
+		}
+	).finally(() => {
 		dashboardOpen = false;
 		dashboardHandle = undefined;
 		refreshUi(ctx);
