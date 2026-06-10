@@ -68,6 +68,7 @@ type GaudConfig = {
 		"gaud-implementer"?: string[];
 		"gaud-code-review"?: string;
 	};
+	models?: Record<string, string>;
 	promptSources?: Partial<Record<PromptRole, PromptSource>>;
 };
 
@@ -541,7 +542,7 @@ Plan first, derive the worker assignment yourself, then ask the Pi extension to 
 11. If the plan is too vague to derive parallel workstreams, tighten the plan yourself before asking the user.`;
 }
 
-export function agentCommand(agent: string, commandName: string, promptPath: string, fake: boolean): string {
+export function agentCommand(agent: string, commandName: string, promptPath: string, fake: boolean, model?: string): string {
 	if (fake) {
 		return `bash -lc ${shellQuote(`echo "[gaud] fake ${agent} worker started"; sleep 2; echo "[gaud] fake ${agent} worker done"; "$GAUD_CALLBACK_BIN" done --summary "fake ${agent} completed"; exec bash`)}`;
 	}
@@ -555,12 +556,18 @@ export function agentCommand(agent: string, commandName: string, promptPath: str
 	const autoCallback = `(status=$?; if [ ! -e ${callbackMarker} ]; then if [ "$status" -eq 0 ]; then "$GAUD_CALLBACK_BIN" done --summary "${agent} completed without explicit callback"; else "$GAUD_CALLBACK_BIN" failed --summary "${agent} exited with status $status"; fi; fi; exec bash)`;
 	const wrap = (invocation: string) => `bash -lc ${shellQuote(`B2V_DISABLED=true ${invocation}; ${autoCallback}`)}`;
 
-	if (agent === "claude") return wrap(`${cmd} --dangerously-skip-permissions --print ${promptSubstitution}`);
-	if (agent === "codex") return wrap(`${cmd} --yolo ${promptSubstitution}`);
-	if (agent === "gemini") return wrap(`${cmd} --yolo -i ${promptSubstitution}`);
-	if (agent === "opencode") return wrap(`${cmd} --prompt ${promptSubstitution}`);
-	if (agent === "antigravity" || agent === "agy") return wrap(`${cmd} --dangerously-skip-permissions --print ${promptSubstitution}`);
-	return wrap(`${cmd} ${promptSubstitution}`);
+	let invocation = "";
+	if (agent === "claude") invocation = `${cmd} --dangerously-skip-permissions --print ${promptSubstitution}`;
+	else if (agent === "codex") invocation = `${cmd} --yolo ${promptSubstitution}`;
+	else if (agent === "gemini") invocation = `${cmd} --yolo -i ${promptSubstitution}`;
+	else if (agent === "opencode") invocation = `${cmd} --prompt ${promptSubstitution}`;
+	else if (agent === "antigravity" || agent === "agy") invocation = `${cmd} --dangerously-skip-permissions --print ${promptSubstitution}`;
+	else invocation = `${cmd} ${promptSubstitution}`;
+
+	if (model) {
+		invocation = `${invocation} --model ${shellQuote(model)}`;
+	}
+	return wrap(invocation);
 }
 
 function formatAge(ts?: number): string {
@@ -957,6 +964,8 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 
 	const id = makeRunId();
 	const repoRoot = ctx.cwd;
+	const config = await loadGaudConfig(repoRoot);
+	const models = config?.models || {};
 	const runDir = path.join(repoRoot, ".gaud", "runs", id);
 	pollerLogPath = path.join(runDir, "poller.log");
 	const eventsPath = path.join(runDir, "events.jsonl");
@@ -1019,7 +1028,7 @@ async function launchRun(pi: ExtensionAPI, ctx: ExtensionContext, task: string, 
 		const logPath = path.join(workerDir, "pane.log");
 		await writeFile(promptPath, workerPrompt(task, agent, workerId, plan), "utf8");
 		await writeFile(logPath, "", "utf8");
-		const command = agentCommand(agent, commandName, promptPath, fake);
+		const command = agentCommand(agent, commandName, promptPath, fake, models[agent]);
 		const workerRole = plan?.role ?? "Implementer";
 		const envPrefix = workerEnvPrefix({ id: workerId, agent, role: workerRole, workstream: workerId });
 		const paneResult = await tmux(run, ["split-window", "-d", "-t", tmuxSession, "-P", "-F", "#{pane_id}", "bash"]);
@@ -1692,15 +1701,23 @@ async function pickImplementers(ctx: ExtensionContext, installed: string[], pref
 	const selected: string[] = [];
 	const preferredInstalled = preferred.filter((agent) => installed.includes(agent));
 	if (preferredInstalled.length > 0) {
-		const useDefaults = await ctx.ui.confirm("Gaud implementers", `Use saved implementers?\n\n${preferredInstalled.join(", ")}`);
+		const useDefaults = await ctx.ui.confirm(
+			"Gaud Implementers",
+			`Use current implementer agents?\n\n${preferredInstalled.map(formatAgentChoice).join("\n")}`
+		);
 		if (useDefaults) return preferredInstalled;
 	}
 
 	while (true) {
 		const remaining = installed.filter((agent) => !selected.includes(agent));
 		if (remaining.length === 0) break;
+
+		const title = selected.length > 0
+			? `Selected: ${selected.join(", ")}. Add another Implementer agent (runs parallel tasks)?`
+			: "Select Implementer Agent (runs the parallel coding tasks/tickets)";
+
 		const choiceText = await ctx.ui.select(
-			"Add implementer agent",
+			title,
 			selected.length > 0
 				? ["Done", ...remaining.map(formatAgentChoice)]
 				: remaining.map(formatAgentChoice),
@@ -1709,7 +1726,10 @@ async function pickImplementers(ctx: ExtensionContext, installed: string[], pref
 		const choice = parseAgentChoice(choiceText)!;
 		selected.push(choice);
 		if (selected.length >= 3) {
-			const addMore = await ctx.ui.confirm("More implementers?", `Selected: ${selected.join(", ")}\nAdd another implementer?`);
+			const addMore = await ctx.ui.confirm(
+				"Add more implementers?",
+				`Currently selected implementers: ${selected.join(", ")}\nWould you like to add another implementer agent?`
+			);
 			if (!addMore) break;
 		}
 	}
@@ -1802,6 +1822,19 @@ async function runSetupWizard(ctx: ExtensionContext) {
 	ctx.ui.notify(`Gaud config saved to ${localConfigPath(ctx.cwd)}`, "info");
 }
 
+function suggestedModelsForAgent(agent: string): string[] {
+	switch (agent.toLowerCase()) {
+		case "claude":
+			return ["claude-3-5-sonnet", "claude-3-opus", "claude-3-5-haiku"];
+		case "gemini":
+		case "antigravity":
+		case "agy":
+			return ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-2.0-pro-exp"];
+		default:
+			return [];
+	}
+}
+
 async function chooseRoleAgents(ctx: ExtensionContext, parsedAgents: string[]): Promise<GaudConfig | undefined> {
 	const installed = await detectInstalledAgents();
 	if (installed.length === 0) {
@@ -1810,14 +1843,66 @@ async function chooseRoleAgents(ctx: ExtensionContext, parsedAgents: string[]): 
 	}
 	const saved = await loadGaudConfig(ctx.cwd);
 	const seededImplementers = parsedAgents.length > 0 ? parsedAgents.filter((agent) => installed.includes(agent)) : saved?.roles["gaud-implementer"];
-	const design = await pickAgent(ctx, "gaud-design agent", installed, saved?.roles["gaud-design"]);
+	
+	const design = await pickAgent(ctx, "Select Design Agent (defines UX/UI, user flows, and product shape)", installed, saved?.roles["gaud-design"]);
 	if (!design) return undefined;
-	const eng = await pickAgent(ctx, "gaud-eng agent", installed, saved?.roles["gaud-eng"]);
+	const eng = await pickAgent(ctx, "Select Engineering Agent (defines architecture, state, and API design)", installed, saved?.roles["gaud-eng"]);
 	if (!eng) return undefined;
 	const implementers = await pickImplementers(ctx, installed, seededImplementers);
 	if (implementers.length === 0) return undefined;
-	const review = await pickAgent(ctx, "gaud-code-review agent", installed, saved?.roles["gaud-code-review"]);
+	const review = await pickAgent(ctx, "Select Code Reviewer Agent (validates code correctness, runs tests, and checks integration)", installed, saved?.roles["gaud-code-review"]);
 	if (!review) return undefined;
+
+	const models: Record<string, string> = saved?.models || {};
+	const activeAgents = new Set<string>([design, eng, review, ...implementers]);
+
+	// Clean up models of inactive agents
+	for (const key of Object.keys(models)) {
+		if (!activeAgents.has(key)) {
+			delete models[key];
+		}
+	}
+
+	const configureModels = await ctx.ui.confirm(
+		"Configure custom models?",
+		`Would you like to configure custom models for the selected agents?\n(Default models will be used otherwise)`
+	);
+
+	if (configureModels) {
+		for (const agent of activeAgents) {
+			const currentModel = models[agent];
+			const suggestions = suggestedModelsForAgent(agent);
+			const options: string[] = [];
+			if (currentModel) {
+				options.push(`Keep current: ${currentModel}`);
+			}
+			options.push("Use default model");
+			for (const sug of suggestions) {
+				if (sug !== currentModel) {
+					options.push(sug);
+				}
+			}
+			options.push("Specify custom model...");
+
+			const modelChoice = await ctx.ui.select(`Model for ${agent}`, options);
+			if (!modelChoice) continue;
+
+			if (modelChoice === "Specify custom model...") {
+				const customModel = await ctx.ui.input(`Model name for ${agent}`, currentModel || "");
+				if (customModel && customModel.trim()) {
+					models[agent] = customModel.trim();
+				} else {
+					delete models[agent];
+				}
+			} else if (modelChoice === "Use default model") {
+				delete models[agent];
+			} else if (modelChoice.startsWith("Keep current:")) {
+				// Keep existing
+			} else {
+				models[agent] = modelChoice;
+			}
+		}
+	}
 
 	const config: GaudConfig = {
 		orchestrator: { type: "pi", agent: "pi" },
@@ -1827,9 +1912,12 @@ async function chooseRoleAgents(ctx: ExtensionContext, parsedAgents: string[]): 
 			"gaud-implementer": implementers,
 			"gaud-code-review": review,
 		},
+		models,
 	};
 
-	const save = await ctx.ui.confirm("Save Gaud defaults?", `Save these role defaults to ${localConfigPath(ctx.cwd)}?\n\nOrchestrator: pi\nDesign: ${design}\nEng: ${eng}\nImplementers: ${implementers.join(", ")}\nCode review: ${review}`);
+	const modelLines = Object.entries(models).map(([a, m]) => `  ${a}: ${m}`).join("\n");
+	const modelSummary = modelLines ? `\nModels:\n${modelLines}` : "";
+	const save = await ctx.ui.confirm("Save Gaud defaults?", `Save these defaults to ${localConfigPath(ctx.cwd)}?\n\nOrchestrator: pi\nDesign: ${design}\nEng: ${eng}\nImplementers: ${implementers.join(", ")}\nCode review: ${review}${modelSummary}`);
 	if (save) await saveLocalGaudConfig(ctx.cwd, config);
 	return config;
 }
@@ -1874,6 +1962,7 @@ async function defaultRoleAgentsForRun(ctx: ExtensionContext, parsedAgents: stri
 			"gaud-implementer": implementers,
 			"gaud-code-review": review,
 		},
+		models: saved?.models,
 		promptSources: saved?.promptSources,
 	};
 	const needsPersistedRoles = !savedRoles["gaud-design"] || !savedRoles["gaud-eng"] || !savedRoles["gaud-implementer"]?.length || !savedRoles["gaud-code-review"];

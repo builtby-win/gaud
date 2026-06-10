@@ -60,6 +60,12 @@ describe('Agent command generation', () => {
     }
   });
 
+  it('appends model parameter if provided', () => {
+    const command = agentCommand('claude', 'claude', '/tmp/prompt.txt', false, 'claude-3-5-sonnet');
+    expect(command).toContain('--model');
+    expect(command).toContain('claude-3-5-sonnet');
+  });
+
   it('uses Codex persistent YOLO mode instead of one-shot exec', () => {
     const command = agentCommand('codex', 'codex', '/tmp/prompt.txt', false);
 
