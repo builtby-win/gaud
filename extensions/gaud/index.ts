@@ -660,6 +660,58 @@ function tmuxWorkerViewCommand(run: GaudRunState, worker: WorkerState): string {
 		: tmuxAttachCommand(run);
 }
 
+// Opens the given shell command in a brand-new OS terminal window. Attaching to
+// tmux requires a real TTY, so running it inside Pi's non-interactive shell
+// fails with "open terminal failed: not a terminal". We instead spawn a fresh
+// terminal emulator window that hosts the tmux client.
+async function openInNewTerminal(command: string): Promise<{ ok: boolean; error?: string }> {
+	if (process.platform === "darwin") {
+		// AppleScript string escaping: backslash then double-quote.
+		const escaped = command.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+		if (process.env.TERM_PROGRAM === "iTerm.app") {
+			const script = [
+				'tell application "iTerm"',
+				"  create window with default profile",
+				`  tell current session of current window to write text "${escaped}"`,
+				"  activate",
+				"end tell",
+			].join("\n");
+			const result = await execFile("osascript", ["-e", script], { timeoutMs: 10_000 });
+			if (result.code === 0) return { ok: true };
+		}
+		const result = await execFile(
+			"osascript",
+			[
+				"-e", `tell application "Terminal" to do script "${escaped}"`,
+				"-e", `tell application "Terminal" to activate`,
+			],
+			{ timeoutMs: 10_000 },
+		);
+		if (result.code === 0) return { ok: true };
+		return { ok: false, error: result.stderr.trim() || `osascript exited ${result.code}` };
+	}
+
+	// Linux / other: try common terminal emulators in order.
+	const emulators: Array<[string, string[]]> = [
+		["x-terminal-emulator", ["-e", "bash", "-lc", command]],
+		["gnome-terminal", ["--", "bash", "-lc", command]],
+		["konsole", ["-e", "bash", "-lc", command]],
+		["xterm", ["-e", "bash", "-lc", command]],
+	];
+	for (const [emu, args] of emulators) {
+		if (await commandExists(emu)) {
+			try {
+				const child = spawn(emu, args, { detached: true, stdio: "ignore" });
+				child.unref();
+				return { ok: true };
+			} catch (error) {
+				return { ok: false, error: error instanceof Error ? error.message : String(error) };
+			}
+		}
+	}
+	return { ok: false, error: "No supported terminal emulator found." };
+}
+
 function renderWidget(): string[] {
 	if (!activeRun || isTerminalRunStatus(activeRun.status)) return [];
 	const spinner = pollInFlight ? "⟳" : "○";
@@ -685,7 +737,7 @@ function renderWidget(): string[] {
 	if (stuckOrWaiting.length > 0) {
 		lines.push(`⚠ needs attention: ${stuckOrWaiting.join(", ")} — /gaud-peek ${stuckOrWaiting[0]} or Ctrl+Shift+G`);
 	}
-	lines.push(`Dashboard: Ctrl+Shift+G / Ctrl+D (q to close) · /gaud-peek [worker] · ${tmuxAttachCommand(activeRun)}`);
+	lines.push(`Dashboard: Ctrl+Shift+G / Alt+D (q to close) · /gaud-peek [worker] · ${tmuxAttachCommand(activeRun)}`);
 	return lines;
 }
 
@@ -1278,6 +1330,11 @@ async function pollOnce(pi: ExtensionAPI, ctx: ExtensionContext) {
 		if (activeRun) appendPollerLog(activeRun, "poll_error", { durationMs: Date.now() - lastPollStartedAt, error: lastPollError, consecutivePollErrors });
 		try {
 			if (extensionActive) ctx.ui.notify(`Gaud poll error: ${lastPollError}\n\nNext poll in ${formatEta(nextPollAt)}. Use /gaud-peek or /gaud-attach to inspect workers.`, "error");
+			if (consecutivePollErrors > 5) {
+				try {
+					pi.sendUserMessage(`GAUDMODE failed\n\nPersistent polling error detected: ${lastPollError}. Poller health is critical. Use /gaud-status to check run state and /gaud-logs for details.`, { deliverAs: "followUp" });
+				} catch { /* stale ctx */ }
+			}
 		} catch {
 			// Ignore stale extension contexts during shutdown/reload.
 		}
@@ -2100,6 +2157,15 @@ class GaudDashboardComponent implements Component {
 	private tick: ReturnType<typeof setInterval> | undefined;
 	private zoomed = false;
 	private zoomScrollOffset = 0;
+	// Embedded live terminal state.
+	private liveTerminal = false;
+	private liveTimer: ReturnType<typeof setInterval> | undefined;
+	private liveLines: string[] = [];
+	private livePaneId: string | undefined;
+	private liveWorkerId: string | undefined;
+	private liveSized = false;
+	private liveBusy = false;
+	private lastWidth = 80;
 
 	constructor(
 		private tui: TUI,
@@ -2116,6 +2182,102 @@ class GaudDashboardComponent implements Component {
 	dispose(): void {
 		if (this.tick) clearInterval(this.tick);
 		this.tick = undefined;
+		if (this.liveTimer) clearInterval(this.liveTimer);
+		this.liveTimer = undefined;
+		// Restore tmux window sizing if we were running an embedded terminal.
+		if (this.liveSized) void this.restoreLiveSize();
+		this.liveTerminal = false;
+	}
+
+	public isLiveTerminal(): boolean {
+		return this.liveTerminal;
+	}
+
+	private liveViewport(): { cols: number; rows: number } {
+		const cols = Math.max(20, this.lastWidth);
+		// Reserve 2 header lines + 1 footer line.
+		const rows = Math.max(5, this.tui.terminal.rows - 3);
+		return { cols, rows };
+	}
+
+	// Resize the tmux window to our viewport and zoom the worker's pane so the
+	// mirrored capture fills the available space, just like a real attach.
+	private async applyLiveSize(): Promise<void> {
+		if (!activeRun || !this.livePaneId) return;
+		const { cols, rows } = this.liveViewport();
+		await tmux(activeRun, ["set-option", "-g", "window-size", "manual"]);
+		await tmux(activeRun, ["resize-window", "-t", activeRun.tmuxSession, "-x", String(cols), "-y", String(rows)]);
+		const zoomed = await tmux(activeRun, ["display-message", "-p", "-t", this.livePaneId, "#{window_zoomed_flag}"]);
+		if (zoomed.stdout.trim() !== "1") {
+			await tmux(activeRun, ["resize-pane", "-Z", "-t", this.livePaneId]);
+		}
+		this.liveSized = true;
+	}
+
+	private async restoreLiveSize(): Promise<void> {
+		this.liveSized = false;
+		if (!activeRun) return;
+		const pane = this.livePaneId;
+		if (pane) {
+			const zoomed = await tmux(activeRun, ["display-message", "-p", "-t", pane, "#{window_zoomed_flag}"]);
+			if (zoomed.stdout.trim() === "1") {
+				await tmux(activeRun, ["resize-pane", "-Z", "-t", pane]);
+			}
+		}
+		await tmux(activeRun, ["set-option", "-g", "window-size", "latest"]);
+	}
+
+	private async enterLiveTerminal(): Promise<void> {
+		const worker = this.selectedWorker();
+		if (!activeRun || !worker?.paneId) {
+			this.ctx.ui.notify("No live pane available for this worker yet.", "warning");
+			return;
+		}
+		this.liveTerminal = true;
+		this.zoomed = false;
+		this.livePaneId = worker.paneId;
+		this.liveWorkerId = worker.id;
+		this.liveLines = ["(connecting to pane…)"];
+		this.tui.requestRender();
+		await this.applyLiveSize();
+		await this.refreshLive();
+		if (this.liveTimer) clearInterval(this.liveTimer);
+		this.liveTimer = setInterval(() => { void this.refreshLive(); }, 120);
+	}
+
+	private async exitLiveTerminal(): Promise<void> {
+		if (this.liveTimer) clearInterval(this.liveTimer);
+		this.liveTimer = undefined;
+		await this.restoreLiveSize();
+		this.liveTerminal = false;
+		this.livePaneId = undefined;
+		this.liveWorkerId = undefined;
+		this.liveLines = [];
+		this.tui.requestRender();
+	}
+
+	private async refreshLive(): Promise<void> {
+		if (!this.liveTerminal || !activeRun || !this.livePaneId || this.liveBusy) return;
+		this.liveBusy = true;
+		try {
+			const result = await tmux(activeRun, ["capture-pane", "-e", "-p", "-t", this.livePaneId]);
+			if (result.code === 0) {
+				this.liveLines = result.stdout.replace(/\n+$/, "").split("\n");
+				this.tui.requestRender();
+			}
+		} finally {
+			this.liveBusy = false;
+		}
+	}
+
+	// Forward raw input bytes to the pane as hex so control/escape sequences
+	// (arrows, Ctrl+C, etc.) are delivered to the worker program verbatim.
+	private async forwardKeys(data: string): Promise<void> {
+		if (!activeRun || !this.livePaneId) return;
+		const hex = Array.from(Buffer.from(data, "utf8")).map((b) => b.toString(16).padStart(2, "0"));
+		if (hex.length === 0) return;
+		await tmux(activeRun, ["send-keys", "-t", this.livePaneId, "-H", ...hex]);
+		void this.refreshLive();
 	}
 
 	private workers(): WorkerState[] {
@@ -2138,12 +2300,32 @@ class GaudDashboardComponent implements Component {
 		this.ctx.ui.notify(worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun), "info");
 	}
 
+	// Closes the dashboard and opens the tmux pane in its own terminal window.
+	// Falls back to prefilling the editor if no terminal can be launched.
+	private launchAttach(cmd: string) {
+		const ctx = this.ctx;
+		this.close();
+		ctx.ui.notify(`Opening tmux pane in a new terminal window…\n${cmd}`, "info");
+		void openInNewTerminal(cmd).then((res) => {
+			if (!res.ok) {
+				ctx.ui.setEditorText(`!${cmd}`);
+				ctx.ui.notify(`Could not open a new terminal automatically (${res.error}).\nPrefilled the attach command instead — press Enter to attach:\n${cmd}`, "error");
+			}
+		});
+	}
+
 	public isZoomed(): boolean {
 		return this.zoomed;
 	}
 
 	handleInput(data: string): void {
 		const workers = this.workers();
+		// Embedded live terminal: forward every keystroke to the pane. Ctrl+] exits.
+		if (this.liveTerminal) {
+			if (data === "\x1d") { void this.exitLiveTerminal(); return; }
+			void this.forwardKeys(data);
+			return;
+		}
 		if (this.zoomed) {
 			if (matchesKey(data, "escape") || matchesKey(data, "q") || matchesKey(data, "z")) {
 				this.zoomed = false;
@@ -2174,6 +2356,10 @@ class GaudDashboardComponent implements Component {
 				const contentH = Math.max(5, maxH - 5);
 				this.zoomScrollOffset = this.zoomScrollOffset + contentH;
 			}
+			else if (matchesKey(data, "t")) {
+				void this.enterLiveTerminal();
+				return;
+			}
 			else if (matchesKey(data, "s")) {
 				const worker = this.selectedWorker();
 				if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
@@ -2188,12 +2374,7 @@ class GaudDashboardComponent implements Component {
 			else if (matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y")) {
 				const worker = this.selectedWorker();
 				const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
-				const ctx = this.ctx;
-				this.close();
-				if (cmd) {
-					ctx.ui.setEditorText(`!${cmd}`);
-					ctx.ui.notify(`Prefilled input with attach command. Press Enter to attach:\n${cmd}`, "info");
-				}
+				if (cmd) this.launchAttach(cmd);
 			}
 			this.tui.requestRender();
 			return;
@@ -2205,9 +2386,13 @@ class GaudDashboardComponent implements Component {
 		else if (matchesKey(data, "g")) this.selected = 0;
 		else if (data === "G") this.selected = Math.max(0, workers.length - 1);
 		else if (matchesKey(data, "p") || matchesKey(data, "space")) this.showPane = !this.showPane;
-		else if (matchesKey(data, "z")) {
+		else if (matchesKey(data, "z") || matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y")) {
 			this.zoomed = true;
 			this.zoomScrollOffset = 0;
+		}
+		else if (matchesKey(data, "t")) {
+			void this.enterLiveTerminal();
+			return;
 		}
 		else if (matchesKey(data, "r")) void pollOnce(this.pi, this.ctx).then(() => this.tui.requestRender());
 		else if (matchesKey(data, "c")) {
@@ -2239,16 +2424,10 @@ class GaudDashboardComponent implements Component {
 			const worker = this.selectedWorker();
 			if (worker) void restartWorker(this.pi, this.ctx, worker.id).then(() => this.tui.requestRender());
 		}
-		else if (matchesKey(data, "a")) this.notifyAttach();
-		else if (matchesKey(data, "return") || matchesKey(data, "v") || matchesKey(data, "y") || matchesKey(data, "z")) {
+		else if (matchesKey(data, "a")) {
 			const worker = this.selectedWorker();
 			const cmd = activeRun ? (worker ? tmuxWorkerViewCommand(activeRun, worker) : tmuxAttachCommand(activeRun)) : undefined;
-			const ctx = this.ctx;
-			this.close();
-			if (cmd) {
-				ctx.ui.setEditorText(`!${cmd}`);
-				ctx.ui.notify(`Prefilled input with attach command. Press Enter to attach:\n${cmd}`, "info");
-			}
+			if (cmd) this.launchAttach(cmd);
 		}
 		this.tui.requestRender();
 	}
@@ -2256,10 +2435,25 @@ class GaudDashboardComponent implements Component {
 	render(width: number): string[] {
 		const th = this.theme;
 		const innerW = width;
+		this.lastWidth = width;
 		const pad = (value: string) => truncateToWidth(value, innerW, "…", true);
 		const border = (value: string) => th.fg("border", value);
 		const line = (value = "") => pad(value);
 		const lines: string[] = [];
+
+		if (this.liveTerminal) {
+			const label = this.liveWorkerId ?? "pane";
+			lines.push(line(th.fg("accent", ` █ GAUD LIVE TERMINAL · ${label} `) + th.fg("muted", `· keys go to the pane · Ctrl+] to exit`)));
+			const { rows } = this.liveViewport();
+			const body = this.liveLines.slice(0, rows);
+			for (let i = 0; i < rows; i++) {
+				const content = body[i] ?? "";
+				// Reset SGR at end of each line so color state never bleeds across rows.
+				lines.push(line(content + "\x1b[0m"));
+			}
+			lines.push(border("─".repeat(innerW)));
+			return lines;
+		}
 
 		if (this.zoomed) {
 			const worker = this.selectedWorker();
@@ -2271,7 +2465,7 @@ class GaudDashboardComponent implements Component {
 
 				// Header
 				lines.push(line(th.fg("accent", ` █ GAUD ZOOM PANE · ${worker.id} `) + th.fg("muted", `· role: ${worker.role || "unknown"} · status: ${worker.status} · agent: ${worker.agent}`)));
-				lines.push(line(th.fg("muted", "   left/right/h/l cycle worker · up/down/j/k scroll · return/v/y attach · s relaunch · x cancel · q/Esc/z back")));
+				lines.push(line(th.fg("muted", "   left/right/h/l cycle worker · up/down/j/k scroll · t live terminal · a attach · s relaunch · x cancel · q/Esc/z back")));
 				lines.push(line());
 
 				const paneOutput = worker.lastPeek || "(no output captured yet)";
@@ -2305,7 +2499,7 @@ class GaudDashboardComponent implements Component {
 
 		// Header line: full-width highlighted bar
 		lines.push(line(th.fg("accent", ` █ GAUD DASHBOARD `) + th.fg("muted", `· ${activeRun ? activeRun.id : "no active run"} · status: ${activeRun ? activeRun.status : ""}`)));
-		lines.push(line(th.fg("muted", "   j/k/↑↓ navigate · return/v/y attach · z zoom pane · p pane output · c check status · s relaunch · x cancel · r refresh · q close")));
+		lines.push(line(th.fg("muted", "   j/k/↑↓ navigate · t live terminal · enter/v/y zoom pane · a attach · p pane output · c check status · s relaunch · x cancel · r refresh · q close")));
 		lines.push(line());
 		if (activeRun) {
 			const workers = this.workers();
@@ -2385,12 +2579,12 @@ function showGaudDashboard(pi: ExtensionAPI, ctx: ExtensionContext) {
 	let component: GaudDashboardComponent | undefined;
 
 	const overlayOptions = (): OverlayOptions => {
-		const isZoomed = component ? component.isZoomed() : false;
+		const isFull = component ? (component.isZoomed() || component.isLiveTerminal()) : false;
 		return {
 			anchor: "top-left",
 			width: "100%",
 			minWidth: 56,
-			maxHeight: isZoomed ? "100%" : "50%",
+			maxHeight: isFull ? "100%" : "50%",
 			margin: 0,
 			offsetX: 0,
 			offsetY: 0,
@@ -2527,7 +2721,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 		const done = workers.filter((w) => w.status === "done").length;
 		const workerSummary = workers.map((w) => `  ${workerStatusSymbol(w.status)} ${w.id} (${w.agent}/${w.role}): ${w.status}${w.summary ? ` — ${w.summary.slice(0, 80)}` : ""}`).join("\n");
 		const stuckBlock = stuck.length > 0 ? `\n⚠ NEEDS ATTENTION: ${stuck.map((w) => w.id).join(", ")}. Investigate in tmux or use /gaud-peek ${stuck[0]!.id}.` : "";
-		const dashboardHint = activeRun && ctx.hasUI ? `\nDashboard: Ctrl+Shift+G or Ctrl+D. Close with q or Escape.` : "";
+		const dashboardHint = activeRun && ctx.hasUI ? `\nDashboard: Ctrl+Shift+G or Alt+D. Close with q or Escape.` : "";
 		return {
 			systemPrompt: event.systemPrompt + `\n\n[GAUD ACTIVE — ${activeRun.id}]\nStatus: ${activeRun.status} · ${done}/${workers.length} workers done · poll: ${pollHealthText()}\nTask: ${activeRun.task}\nMilestone: ${activeRun.currentMilestone ?? "M1"}\nWorkers:\n${workerSummary}${stuckBlock}${dashboardHint}\n\nCallbacks arrive as GAUDMODE messages. Use tmux commands from follow-up messages to investigate stuck workers. Do NOT run gaud-poll or gaud-mode skill commands — the extension owns all polling.`,
 		};
@@ -2591,7 +2785,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerShortcut("ctrl+d", {
+	pi.registerShortcut("alt+d", {
 		description: "Focus/open Gaud dashboard (alternative)",
 		handler: async (ctx) => {
 			if (activeRun) await pollOnce(pi, ctx);
@@ -2629,6 +2823,7 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				objective: Type.String({ description: "The exact plan ticket/workstream this worker should accomplish." }),
 				files: Type.Array(Type.String(), { description: "Primary files or file patterns this plan workstream should focus on." }),
 				doneCriteria: Type.Array(Type.String(), { description: "Plan-tied done criteria. Concrete, verifiable." }),
+				requiresPermission: Type.Optional(Type.Boolean({ description: "Explicitly require user approval before launching this worker." })),
 			}), { description: "Required for real runs. Explicit plan-derived worker assignments chosen by the foreground agent." })),
 			agents: Type.Optional(Type.Array(Type.String(), { description: "Deprecated shorthand. For real runs, choose agents per explicit worker instead." })),
 			fake: Type.Optional(Type.Boolean({ description: "Launch fake bash workers for smoke testing." })),
@@ -2649,7 +2844,9 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				await mkdir(planDir, { recursive: true });
 				const planPath = path.join(planDir, `${makeRunId()}-plan.md`);
 				await writeFile(planPath, basePlan, "utf8");
-				const approved = params.fake ? true : await confirmWorkerLaunch(ctx, workerPlans, planPath);
+
+				const requiresPermission = params.workers.some((w) => w.requiresPermission === true) || params.workers.length > 2;
+				const approved = (params.fake || !requiresPermission) ? true : await confirmWorkerLaunch(ctx, workerPlans, planPath);
 				if (!approved) {
 					const summary = formatWorkerApprovalSummary(workerPlans, planPath);
 					return { content: [{ type: "text", text: `Gaud plan saved, but no workers were launched because user approval is required.\n\n${summary}` }], details: { run: activeRun, reason: params.reason, approved: false, workers: workerPlans.length, planPath } };
@@ -2820,12 +3017,17 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (parsed.fake) {
-				await launchRun(pi, ctx, parsed.task, parsed.agents, true, "User ran /gaud fake smoke run.");
+				await launchRun(pi, ctx, parsed.task, parsed.agents, true, "User explicitly requested fake Gaud smoke run.");
 				return;
 			}
+			const configExists = existsSync(localConfigPath(ctx.cwd));
+			if (!configExists) {
+				ctx.ui.notify("No Gaud config found. Running doctor preflight...", "info");
+				ctx.ui.notify((await doctorLines(parsed.agents)).join("\n"), "info");
+			}
 			delegateGaudPlanningToAgent(pi, ctx, parsed.task === "plan" ? "PLAN.md" : args.trim());
-		},
-	});
+			},
+			});
 
 	pi.registerCommand("gaud-dashboard", {
 		description: "Open interactive Gaud dashboard overlay",
@@ -2883,9 +3085,14 @@ export default function gaudExtension(pi: ExtensionAPI) {
 				return;
 			}
 			const cmd = tmuxAttachCommand(activeRun);
-			ctx.ui.setEditorText(`!${cmd}`);
 			const workerCommands = Object.values(activeRun.workers).map((worker) => `${worker.id}: ${tmuxWorkerViewCommand(activeRun!, worker)}`);
-			ctx.ui.notify([`Prefilled input with attach command. Press Enter to attach.`, ``, `Worker panes:`, ...workerCommands].join("\n"), "info");
+			const res = await openInNewTerminal(cmd);
+			if (res.ok) {
+				ctx.ui.notify([`Opening tmux session in a new terminal window…`, cmd, ``, `Worker panes:`, ...workerCommands].join("\n"), "info");
+			} else {
+				ctx.ui.setEditorText(`!${cmd}`);
+				ctx.ui.notify([`Could not open a new terminal automatically (${res.error}).`, `Prefilled the attach command — press Enter to attach.`, ``, `Worker panes:`, ...workerCommands].join("\n"), "error");
+			}
 		},
 	});
 
